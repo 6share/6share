@@ -6,6 +6,6 @@ t=2873397496 2873404696
 a=source-filter: incl IN IP4 * 10.20.30.40
 a=flute-tsi:1
 a=flute-ch:1
-m=application 4001 FLUTE 0
+m=application 4001 FLUTE/UDP 0
 c=IN IP4 226.10.40.1/15
 

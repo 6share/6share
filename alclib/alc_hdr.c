@@ -1,39 +1,47 @@
-/* $Author: peltotal $ $Date: 2004/04/27 06:54:40 $ $Revision: 1.6 $ */
-/*
- *   MAD-ALC, implementation of ALC/LCT protocols
- *   Copyright (c) 2003-2004 TUT - Tampere University of Technology
- *   main authors/contacts: jani.peltotalo@tut.fi and sami.peltotalo@tut.fi
+/** \file alc_hdr.c  \brief ALC header
  *
- *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 2 of the License, or
- *   (at your option) any later version.
+ *  $Author: peltotal $ $Date: 2007/02/28 08:58:00 $ $Revision: 1.22 $
  *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
+ *  MAD-ALCLIB: Implementation of ALC/LCT protocols, Compact No-Code FEC,
+ *  Simple XOR FEC, Reed-Solomon FEC, and RLC Congestion Control protocol.
+ *  Copyright (c) 2003-2007 TUT - Tampere University of Technology
+ *  main authors/contacts: jani.peltotalo@tut.fi and sami.peltotalo@tut.fi
  *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, write to the Free Software
- *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ *  In addition, as a special exception, TUT - Tampere University of Technology
+ *  gives permission to link the code of this program with the OpenSSL library (or
+ *  with modified versions of OpenSSL that use the same license as OpenSSL), and
+ *  distribute linked combinations including the two. You must obey the GNU
+ *  General Public License in all respects for all of the code used other than
+ *  OpenSSL. If you modify this file, you may extend this exception to your version
+ *  of the file, but you are not obligated to do so. If you do not wish to do so,
+ *  delete this exception statement from your version.
  */
 
-#include "inc.h"
+#include <stdio.h>
 
-/*
- * This function adds FEC Payload ID (FEC Encoding ID 128) header to FLUTE's header.
- *
- * Params:	def_lct_hdr_t *def_ldt_hdr: Pointer to the default LCT header,
- *			int hdrlen: Current length of FLUTE header,
- *			unsigned int sbn: Source Block Number,
- *			unsigned int es_id: Encoding Symbol Identifier.
- *
- * Return:	int: Number of bytes added to FLUTE's header
- *
- */
+#ifdef _MSC_VER
+#include <winsock2.h>
+#else
+#include <arpa/inet.h>
+#endif
 
-int add_alc_fpi_128(def_lct_hdr_t *def_lct_hdr, int hdrlen, unsigned int sbn, unsigned int es_id) {
+#include "alc_hdr.h"
+
+int add_alc_fpi_2_128(def_lct_hdr_t *def_lct_hdr, int hdrlen, unsigned int sbn, unsigned int es_id) {
 
 	int len = 0;
 
@@ -44,19 +52,6 @@ int add_alc_fpi_128(def_lct_hdr_t *def_lct_hdr, int hdrlen, unsigned int sbn, un
 	
 	return len;
 }
-
-/*
- * This function adds FEC Payload ID (FEC Encoding ID 129) header to FLUTE's header.
- *
- * Params:	def_lct_hdr_t *def_ldt_hdr: Pointer to the default LCT header,
- *			int hdrlen: Current length of FLUTE header,
- *			unsigned int sbn: Source Block Number,
- *			unsigned short sbl: Source Block Length,
- *			unsigned short es_id: Encoding Symbol Identifier.
- *
- * Return:	int: Number of bytes added to FLUTE's header
- *
- */
 
 int add_alc_fpi_129(def_lct_hdr_t *def_lct_hdr, int hdrlen, unsigned int sbn, 
 					unsigned short sbl, unsigned short es_id) {
@@ -74,18 +69,6 @@ int add_alc_fpi_129(def_lct_hdr_t *def_lct_hdr, int hdrlen, unsigned int sbn,
 	return len;
 }
 
-/*
- * This function adds FEC Payload ID (FEC Encoding ID 0, 130) header to FLUTE's header.
- *
- * Params:	def_lct_hdr_t *def_ldt_hdr: Pointer to the default LCT header,
- *			int hdrlen: Current length of FLUTE header,
- *			unsigned short sbn: Source Block Number,
- *			unsigned short es_id: Encoding Symbol Identifier.
- *
- * Return:	int: Number of bytes added to FLUTE's header
- *
- */
-
 int add_alc_fpi_0_130(def_lct_hdr_t *def_lct_hdr, int hdrlen, unsigned short sbn, unsigned short es_id) {
 
 	int len = 0;
@@ -98,3 +81,19 @@ int add_alc_fpi_0_130(def_lct_hdr_t *def_lct_hdr, int hdrlen, unsigned short sbn
 
 	return len;
 }
+
+int add_alc_fpi_3(def_lct_hdr_t *def_lct_hdr, int hdrlen, unsigned int sbn,
+		  unsigned int es_id, unsigned char m) {
+
+	int len = 0;
+	unsigned int word = 0;
+
+	word = ((sbn << m) | (es_id & ((1 << m) - 1)));
+
+	*(unsigned int*)((unsigned char*)def_lct_hdr + hdrlen) = htonl(word);	
+	len += 4;
+
+	return len;
+}
+
+

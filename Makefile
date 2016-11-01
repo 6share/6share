@@ -1,4 +1,4 @@
-all :	alclib sdplib nullfeclib xorfeclib rsfeclib rlclib flute
+all :	alclib sdplib flutelib flute multis_flute flute_unittest
 
 alclib ::
 	@echo "-------------------"
@@ -14,39 +14,32 @@ sdplib ::
 	mkdir lib; cd sdplib; make clean; make                   
 	@echo "done"
 
-nullfeclib ::
-	@echo "------------------------"
-	@echo "*** Null-FEC library ***"
-	@echo "------------------------"
-	mkdir lib; cd nullfeclib; make clean; make
-	@echo "done"
-
-xorfeclib ::
-	@echo "------------------------------"
-	@echo "*** Simple XOR FEC library ***"
-	@echo "------------------------------"
-	mkdir lib; cd xorfeclib; make clean; make
-	@echo "done"
-
-rsfeclib ::
-	@echo "--------------------------------"
-	@echo "*** Reed-Solomon FEC library ***"
-	@echo "--------------------------------"
-	mkdir lib; cd rsfeclib; make clean; make
-	@echo "done"
-
-rlclib ::
-	@echo "-------------------"
-	@echo "*** RLC library ***"
-	@echo "-------------------"
-	mkdir lib; cd rlclib; make clean; make
+flutelib ::
+	@echo "---------------------"
+	@echo "*** FLUTE library ***"
+	@echo "---------------------"
+	mkdir lib; cd flutelib; make clean; make
 	@echo "done"
 
 flute ::
 	@echo "-------------------------"
-	@echo "*** flute application ***"
+	@echo "*** FLUTE application ***"
 	@echo "-------------------------"
 	mkdir bin; cd flute; make clean; make
+	@echo "done"
+
+multis_flute ::
+	@echo "----------------------------------------------"
+	@echo "*** Example multisession FLUTE application ***"
+	@echo "----------------------------------------------"
+	mkdir bin; cd multis_flute; make clean; make
+	@echo "done"
+
+flute_unittest ::
+	@echo "------------------------"
+	@echo "*** FLUTE unit test ***"
+	@echo "------------------------"
+	mkdir bin; cd UnitTest; make clean; make
 	@echo "done"
 
 clean :
@@ -58,24 +51,21 @@ clean :
 	@echo "*** Cleaning SDP library ***"
 	@echo "----------------------------"
 	cd sdplib; make clean
-	@echo "---------------------------------"
-	@echo "*** Cleaning Null-FEC library ***"
-	@echo "---------------------------------"
-	cd nullfeclib; make clean
-	@echo "---------------------------------------"
-	@echo "*** Cleaning Simple XOR FEC library ***"
-	@echo "---------------------------------------"
-	cd xorfeclib; make clean
-	@echo "-----------------------------------------"
-	@echo "*** Cleaning Reed-Solomon FEC library ***"
-	@echo "-----------------------------------------"
-	cd rsfeclib; make clean
-	@echo "----------------------------"
-	@echo "*** Cleaning RLC library ***"
-	@echo "----------------------------"
-	cd rlclib; make clean
+	@echo "------------------------------"
+	@echo "*** Cleaning FLUTE library ***"
+	@echo "------------------------------"
+	cd flutelib; make clean
 	@echo "----------------------------------"
-	@echo "*** Cleaning flute application ***"
+	@echo "*** Cleaning FLUTE application ***"
 	@echo "----------------------------------"
 	cd flute; make clean
+	@echo "-------------------------------------------------------"
+	@echo "*** Cleaning example multisession FLUTE application ***"
+	@echo "-------------------------------------------------------"
+	cd multis_flute; make clean
+	@echo "--------------------------------"
+	@echo "*** Cleaning FLUTE unit test ***"
+	@echo "--------------------------------"
+	cd UnitTest; make clean
 	@echo "done"
+
