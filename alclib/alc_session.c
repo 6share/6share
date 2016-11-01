@@ -1,688 +1,800 @@
-/* $Author: peltotal $ $Date: 2004/09/20 09:20:50 $ $Revision: 1.40 $ */
-/*
- *   MAD-ALC, implementation of ALC/LCT protocols
- *   Copyright (c) 2003-2004 TUT - Tampere University of Technology
- *   main authors/contacts: jani.peltotalo@tut.fi and sami.peltotalo@tut.fi
+/** \file alc_session.c \brief ALC session
  *
- *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 2 of the License, or
- *   (at your option) any later version.
+ *  $Author: peltotal $ $Date: 2007/02/28 08:58:00 $ $Revision: 1.103 $
  *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
+ *  MAD-ALCLIB: Implementation of ALC/LCT protocols, Compact No-Code FEC,
+ *  Simple XOR FEC, Reed-Solomon FEC, and RLC Congestion Control protocol.
+ *  Copyright (c) 2003-2007 TUT - Tampere University of Technology
+ *  main authors/contacts: jani.peltotalo@tut.fi and sami.peltotalo@tut.fi
  *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, write to the Free Software
- *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ *  In addition, as a special exception, TUT - Tampere University of Technology
+ *  gives permission to link the code of this program with the OpenSSL library (or
+ *  with modified versions of OpenSSL that use the same license as OpenSSL), and
+ *  distribute linked combinations including the two. You must obey the GNU
+ *  General Public License in all respects for all of the code used other than
+ *  OpenSSL. If you modify this file, you may extend this exception to your version
+ *  of the file, but you are not obligated to do so. If you do not wish to do so,
+ *  delete this exception statement from your version.
  */
 
-#include "inc.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <memory.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
 
-/**** Set global variables ****/
-                                                                                                                                       
-struct alc_session *alc_session_list[MAX_ALC_SESSIONS];
-int nb_alc_session = 0;
+#ifdef _MSC_VER
+#include <process.h>
+#else
+#include <pthread.h>
+#endif
 
-/*
- * This function creates and initializes new session.
- *
- * Params:	int mode: SENDER or RECEIVER,
- *			ULONGLOLNG/unsigned long long tsi: Transport Session Identifier,
- *			ULONGLOLNG/unsigned long long starttime: Session start value,
- *			ULONGLOLNG/unsigned long long stoptime: Session stop value,
- *			char *src_addr: Source address with receiver (NULL with sender),
- *			int family: IP address family (IPv4 or IPv6),
- *			int ttl: Default Time To Live,
- *			unsigned char fec_enc_id: Default FEC Encoding ID,
- *			unsigned short fec_inst_id: Default FEC Instance ID for FEC Encoding IDs >= 128,
- *			unsigned int max_sblen: Default Maximum-Size Source Block Length,
- *			int cc_id: Used congestion control (0 = none, 1 = MAD_CC),
- *			int use_fec_oti_ext_hdr: Use FEC OTI extension header in file objects (1 = yes, 0 = no),
- *			int txrate: Default Transmission rate,
- *			int big_file_mode: Receive big files,
- *			int rx_nb_channel: Maximum number of used channel in receiver,
- *			bool simul_losses: Simulate packet losses in sender,
- *			int fec_ratio: FEC ratio percent,
- *			int verbosity: Verbosity level,
- *			char *base_dir: Base directory for session,
- *			bool half_word: Use half_word in sender,
- *			int accept_expired_fdt_inst: Accept expired FDT Instances in receiver,
- *          double loss_ratio1: Simulated packet loss ratio when previous packet was sent, 
- *          double loss_ratio2: Simulated packet loss ratio when previous packet was not sent,
- *			bool use_ssm: Use Source Specific Multicast (Receiver only),
- *			int encode_content: Encode content (Sender only, ZLIB format for FDT and GZIP format for file).
- *
- * Return:	int: Identifier for created session in success, -1 otherwise
+#include <sys/timeb.h>
+
+#include "alc_session.h"
+#include "mad_rlc.h"
+#include "alc_rx.h"
+#include "alc_tx.h"
+#include "transport.h"
+#include "alc_channel.h"
+
+/**
+ * Use absolute path with base directory.
+ */
+
+#define ABSOLUTE_PATH 1
+
+struct alc_session *alc_session_list[MAX_ALC_SESSIONS]; /**< List which contains all ALC sessions */
+int nb_alc_session = 0; /**< Number of ALC sessions */
+
+/**
+ * Global variables semaphore
+ */
+
+#ifdef _MSC_VER
+RTL_CRITICAL_SECTION session_variables_semaphore;
+#else
+pthread_mutex_t session_variables_semaphore = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+/**
+ * This is a private function, which locks the session.
  *
  */
 
-int open_alc_session(int mode,
-#ifdef WIN32
-					 ULONGLONG tsi,
-					 ULONGLONG starttime,
-					 ULONGLONG stoptime,
+void lock_session() {
+#ifdef _MSC_VER
+  EnterCriticalSection(&session_variables_semaphore);
 #else
-					 unsigned long long tsi,
-					 unsigned long long starttime,
-					 unsigned long long stoptime,
+  pthread_mutex_lock(&session_variables_semaphore);
 #endif
-					 char *src_addr, int addr_family,
-					 int addr_type, int ttl, unsigned char fec_enc_id, unsigned short fec_inst_id,
-					 unsigned int max_sblen, unsigned short eslen, int cc_id, int use_fec_oti_ext_hdr,
-					 int tx_rate, int big_file_mode, int rx_nb_channel, bool simul_losses, int fec_ratio,
-					 int verbosity, char *base_dir, bool half_word, int accept_expired_fdt_inst,
-					 double loss_ratio1, double loss_ratio2
-#ifdef SSM
-					 , bool use_ssm
-#endif
-
-#ifdef USE_ZLIB
-					 , int encode_content) {
-#else 
-					 ) {
-#endif
-
-#ifndef WIN32
-	pthread_attr_t attr;
-#endif
-	alc_session_t *s;
-	int i;
-
-#ifdef USE_RLC
-	int ret_val;
-#endif
-
-	char fullpath[MAX_PATH];
-
-	if(!lib_init) {
-		alc_init();
-		/* alc session list initialization */
-        memset(alc_session_list, 0, MAX_ALC_SESSIONS * sizeof(alc_session_t*));
-	}
-	
-	if(nb_alc_session >= MAX_ALC_SESSIONS) {
-		/* Could not create new alc session */
-		printf("Could not create new alc session: too many sessions!\n");
-		return -1;
-	}
-
-	if (!(s = (alc_session_t*)calloc(1, sizeof(alc_session_t)))) {
-		printf("Could not alloc memory for alc session!\n");
-		return -1;
-	}
-
-	s->mode = mode;
-	s->tsi = tsi;
-	s->state = SActive;
-	s->addr_family = addr_family;
-	s->addr_type = addr_type;
-	s->cc_id = cc_id;
-
-#ifdef USE_RLC
-	if(s->cc_id == RLC) {
-		ret_val = init_mad_rlc(s);
-	
-		if(ret_val < 0) {
-			return ret_val;
-		}
-	}
-#endif
-
-	s->big_file_mode = big_file_mode;
-	s->verbosity = verbosity;
-
-	s->starttime = starttime;
-	s->stoptime = stoptime;
-	
-	if(mode == SENDER) {
-
-		memcpy(s->base_dir, base_dir, strlen(base_dir));
-			
-		s->nb_channel = 0;
-		s->max_channel = MAX_CHANNELS_IN_SESSION;
-		s->simul_losses = simul_losses;
-		s->loss_ratio1 = loss_ratio1;
-		s->loss_ratio2 = loss_ratio2;
-		s->def_fec_ratio = fec_ratio; 
-		s->sent_bytes = 0;
-		s->a_flag = 0;
-		s->fdt_instance_id = 0; /*uplimit 16777215;*/
-		s->def_ttl = ttl;
-		s->def_fec_enc_id = fec_enc_id;
-		s->def_fec_inst_id = fec_inst_id;
-		s->def_max_sblen = max_sblen;
-		s->def_eslen = eslen;
-		s->use_fec_oti_ext_hdr = use_fec_oti_ext_hdr;
-		s->def_tx_rate = tx_rate;
-
-		s->tx_queue_begin = NULL;
-		s->tx_queue_end = NULL;
-		s->tx_queue_size = 0;
-
-		s->first_unit_in_loop = true;
-		s->nb_ready_channel = 0;
-		s->nb_sending_channel = 0;
-
-		s->half_word = half_word;
-#ifdef USE_ZLIB
-		s->encode_content = encode_content;
-#endif
-
-	}
-
-	if(mode == RECEIVER) {
-
-#ifdef SSM
-		s->ssm = use_ssm;
-#endif
-
-#ifdef WIN32
-	
-		memset(fullpath, 0, MAX_PATH);
-
-		if(_fullpath(fullpath, base_dir, MAX_PATH) != NULL) {
-			memcpy(s->base_dir, fullpath, strlen(fullpath));
-		}
-		else {
-			memcpy(s->base_dir, base_dir, strlen(base_dir));
-		}		
-#else
-		memset(fullpath, 0, MAX_PATH);
-	
-		if(getcwd(fullpath, MAX_PATH) != NULL) {
-			memcpy(s->base_dir, fullpath, strlen(fullpath));
-			strcat(s->base_dir, "/");
-			strcat(s->base_dir, base_dir);
-		}
-		else {
-			memcpy(s->base_dir, base_dir, strlen(base_dir));
-		}
-#endif
-
-		s->nb_channel = 0;
-		s->max_channel = rx_nb_channel;
-		s->src_addr = src_addr;
-		s->obj_list = NULL;
-		s->fdt_list = NULL;
-		s->wanted_obj_list = NULL;
-		s->rx_fdt_instance_list = NULL;
-		s->accept_expired_fdt_inst = accept_expired_fdt_inst;
-
-		/* Create receiving thread */
-
-#ifdef WIN32
-		if (CreateThread(NULL, 0, (void*)rx_thread, (void*)s, 0, &s->rx_thread_id) == NULL) {
-			perror("open_alc_session: CreateThread");
-			return -1;
-		}
-#else
-		pthread_attr_init(&attr);
-		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED); 
-
-		if (pthread_create(&s->rx_thread_id, &attr, rx_thread, (void*)s) != 0) {
-			perror("open_alc_session: pthread_create");
-			return -1;
-		}
-#endif
-
-	}
-
-	for(i = 0; i < MAX_ALC_SESSIONS; i++) {
-		if(alc_session_list[i] == NULL) {
-			s->s_id = i;
-			alc_session_list[s->s_id] = s;
-			break;
-		}
-	}
-
-	nb_alc_session++;
-
-	return s->s_id;
 }
 
-/*
- * This function closes session.
- *
- * Params:	int s_id: Session identifier
- *
- * Return:	void
+/**
+ * This is a private function, which unlocks the session.
  *
  */
+
+void unlock_session() {
+#ifdef _MSC_VER
+  LeaveCriticalSection(&session_variables_semaphore);
+#else
+  pthread_mutex_unlock(&session_variables_semaphore);
+#endif
+}
+
+int open_alc_session(alc_arguments_t *a) {
+
+  alc_session_t *s;
+  int i;
+  int retval;
+  struct timeb timeb_current_time;
+  
+#if ABSOLUTE_PATH
+  char fullpath[MAX_PATH_LENGTH];
+#endif
+
+  lock_session();
+  
+  if(!lib_init) {
+    alc_init();
+    /* alc session list initialization */
+    memset(alc_session_list, 0, MAX_ALC_SESSIONS * sizeof(alc_session_t*));
+  }
+  
+  if(nb_alc_session >= MAX_ALC_SESSIONS) {
+    /* Could not create new alc session */
+    printf("Could not create new alc session: too many sessions!\n");
+    unlock_session();
+    return -1;
+  }
+  
+  if (!(s = (alc_session_t*)calloc(1, sizeof(alc_session_t)))) {
+    printf("Could not alloc memory for alc session!\n");
+    unlock_session();
+    return -1;
+  }
+
+  memset(s, 0, sizeof(alc_session_t));
+
+  s->mode = a->mode;
+  s->tsi = a->tsi;
+  s->state = SActive;
+  s->addr_family = a->addr_family;
+  s->addr_type = a->addr_type;
+  s->cc_id = a->cc_id;
+  
+  if(s->cc_id == RLC) {
+    retval = init_mad_rlc(s);
+    
+    if(retval < 0) {
+      unlock_session();
+      return retval;
+    }
+  }
+  
+  s->rx_memory_mode = a->rx_memory_mode;
+  s->verbosity = a->verbosity;
+  s->starttime = a->start_time;
+  s->stoptime = a->stop_time;
+  s->simul_losses = a->simul_losses;
+  s->loss_ratio1 = a->loss_ratio1;
+  s->loss_ratio2 = a->loss_ratio2;
+  
+  if(s->mode == SENDER) {
+
+    ftime(&timeb_current_time);
+	s->ftimestarttime = timeb_current_time.time+timeb_current_time.millitm/1000.0;
+
+    memcpy(s->base_dir, a->base_dir, strlen(a->base_dir));
+    
+    s->nb_channel = 0;
+    s->max_channel = a->nb_channel;
+    s->def_fec_ratio = a->fec_ratio; 
+    s->sent_bytes = 0;
+    s->obj_sent_bytes = 0;
+    s->last_print_tx_percent = 0;
+    s->a_flag = 0;
+    s->fdt_instance_id = 0; /*uplimit 16777215;*/
+    s->def_ttl = a->ttl;
+    s->def_fec_enc_id = a->fec_enc_id;
+    s->def_fec_inst_id = a->fec_inst_id;
+    s->def_max_sblen = a->max_sb_len;
+    s->def_eslen = a->es_len;
+    s->use_fec_oti_ext_hdr = a->use_fec_oti_ext_hdr;
+    s->def_tx_rate = a->tx_rate;
+    s->tx_queue_begin = NULL;
+    s->tx_queue_end = NULL;
+    s->tx_queue_size = 0;
+    s->first_unit_in_loop = TRUE;
+    s->nb_ready_channel = 0;
+    s->nb_sending_channel = 0;
+    s->half_word = a->half_word;
+    s->encode_content = a->encode_content;
+    s->optimize_tx_rate =  a->optimize_tx_rate;
+    s->calculate_session_size = a->calculate_session_size;
+
+    if(((s->cc_id == RLC) || ((s->cc_id == Null) && (s->max_channel != 1)))) {
+
+      /**** Start tx_thread ****/
+      
+#ifdef _MSC_VER
+      s->handle_tx_thread = (HANDLE)_beginthreadex(NULL, 0, (void*)tx_thread, (void*)s, 0, &s->tx_thread_id);
+
+      if(s->handle_tx_thread == NULL) {
+	perror("open_alc_session: _beginthread");
+	unlock_session();
+	return -1;
+      }
+#else
+      if(pthread_create(&s->tx_thread_id, NULL, tx_thread, (void*)s) != 0) {
+	perror("open_alc_session: pthread_create");
+	unlock_session();
+	return -1;
+      }
+#endif
+    }
+  }
+  
+  if(s->mode == RECEIVER) {
+    
+#ifdef SSM
+    s->ssm = a->use_ssm;
+#endif
+
+#if ABSOLUTE_PATH    
+#ifdef _MSC_VER
+    memset(fullpath, 0, MAX_PATH_LENGTH);
+    
+    if(_fullpath(fullpath, a->base_dir, MAX_PATH_LENGTH) != NULL) {
+      memcpy(s->base_dir, fullpath, strlen(fullpath));
+    }
+    else {
+      memcpy(s->base_dir, a->base_dir, strlen(a->base_dir));
+    }
+#else
+    memset(fullpath, 0, MAX_PATH_LENGTH);
+    
+    if(a->base_dir[0] != '/') {
+      
+      if(getcwd(fullpath, MAX_PATH_LENGTH) != NULL) {
+	memcpy(s->base_dir, fullpath, strlen(fullpath));
+	strcat(s->base_dir, "/");
+	strcat(s->base_dir, a->base_dir);
+      }
+      else {
+	memcpy(s->base_dir, a->base_dir, strlen(a->base_dir));
+      }
+    }
+    else {
+      memcpy(s->base_dir, a->base_dir, strlen(a->base_dir));
+    }
+#endif
+#else
+	 memcpy(s->base_dir, a->base_dir, strlen(a->base_dir));
+#endif
+
+    s->nb_channel = 0;
+    s->max_channel = a->nb_channel;
+    s->obj_list = NULL;
+    s->fdt_list = NULL;
+    s->wanted_obj_list = NULL;
+    s->rx_fdt_instance_list = NULL;
+    s->accept_expired_fdt_inst = a->accept_expired_fdt_inst;
+    
+    memset(s->src_addr, 0, 40);
+    
+    if(a->src_addr != NULL) {
+      memcpy(s->src_addr, a->src_addr, strlen(a->src_addr));
+    }
+    
+    /* Create receiving thread */
+    
+#ifdef _MSC_VER
+    s->handle_rx_thread =
+      (HANDLE)_beginthreadex(NULL, 0, (void*)rx_thread, (void*)s, 0, &s->rx_thread_id);
+    
+    if(s->handle_rx_thread == NULL) {
+      perror("open_alc_session: _beginthread");
+      unlock_session();
+      return -1;
+    }
+#else
+    if(pthread_create(&s->rx_thread_id, NULL, rx_thread, (void*)s) != 0) {
+      perror("open_alc_session: pthread_create");
+      unlock_session();
+      return -1;
+    }
+#endif
+    
+  }
+  
+  for(i = 0; i < MAX_ALC_SESSIONS; i++) {
+    if(alc_session_list[i] == NULL) {
+      s->s_id = i;
+      alc_session_list[s->s_id] = s;
+      break;
+    }
+  }
+  
+  nb_alc_session++;
+  
+  unlock_session();
+  return s->s_id;
+}
 
 void close_alc_session(int s_id) {
 
-	int i, ret_val;
-	wanted_obj_t *next_want;
-	wanted_obj_t *want;
-	rx_fdt_instance_t *next_instance;
-	rx_fdt_instance_t *instance;
+  int i;
+  wanted_obj_t *next_want;
+  wanted_obj_t *want;
+  rx_fdt_instance_t *next_instance;
+  rx_fdt_instance_t *instance;
+  
+  tx_queue_t *next_pkt;
+  tx_queue_t *pkt;
+  
+  trans_obj_t *to;
+  
+  alc_session_t *s;
 
-	tx_queue_t *next_pkt;
-	tx_queue_t *pkt;
-	
-	trans_obj_t *to;
-	
-	alc_session_t *s = alc_session_list[s_id];
-	
-	s->state = SClosed;
+#ifdef USE_RETRIEVE_UNIT
+  trans_unit_container_t *tmp;
+  trans_unit_container_t *to_delete;
+#endif
 
-#ifdef WIN32
-	Sleep(1000);
+#ifdef LINUX
+  int join_retval;
+#endif
+
+  /* Wait for open thread. */
+#ifdef _MSC_VER
+  if(alc_session_list[s_id]->handle_rx_thread != NULL) {
+	WaitForSingleObject(alc_session_list[s_id]->handle_rx_thread, INFINITE);
+	CloseHandle(alc_session_list[s_id]->handle_rx_thread);
+	alc_session_list[s_id]->handle_rx_thread = NULL;
+  }
 #else
-	sleep(1);
+  if(alc_session_list[s_id]->rx_thread_id != 0) {   
+     join_retval = pthread_join(alc_session_list[s_id]->rx_thread_id, NULL);
+     assert(join_retval == 0);
+     pthread_detach(alc_session_list[s_id]->rx_thread_id);
+     alc_session_list[s_id]->rx_thread_id = 0;
+  }
 #endif
 
-	for(i = 0; i < s->max_channel; i++) {
-		
-		if(s->ch_list[i] != NULL) {
-			ret_val = close_alc_channel(s->ch_list[i], s);
-		}
-	}
+  lock_session();
+  s = alc_session_list[s_id];
+  s->state = SClosed;  
 
-	/* Closing, free all uncompleted objects, uncompleted fdt instances and wanted obj list */
-			
-	to = s->obj_list;
-
-	while(to != NULL) {
-		free_object(to, s, 1);
-		to = s->obj_list;
-	}
-
-	to = s->fdt_list;
-                                                                                                                                              
-    while(to != NULL) {
-        free_object(to, s, 0);
-        to = s->fdt_list;
+  for(i = 0; i < s->max_channel; i++) {
+    
+    if(s->ch_list[i] != NULL) {
+      close_alc_channel(s->ch_list[i], s);
     }
+  }
 
-	want = s->wanted_obj_list;
+#ifdef USE_RETRIEVE_UNIT
+	tmp = s->unit_pool;
 
-	while(want != NULL) {
-		next_want = want->next;
-		free(want);
-		want = next_want;
-	} 	
-
-	instance = s->rx_fdt_instance_list;
-                                                                                                                                          
-    while(instance != NULL) {
-        next_instance = instance->next;
-        free(instance);
-        instance = next_instance;
-    }
-
-#ifdef USE_RLC
-	if(s->cc_id == RLC) {
-		close_mad_rlc(s);
+	while(tmp != NULL ) {
+		to_delete = tmp;
+		tmp = tmp->next;
+		free(to_delete->u.data);
+		free(to_delete);
 	}
+
+	s->unit_pool = NULL;
 #endif
 
-	pkt = s->tx_queue_begin;
-
-	while(pkt != NULL) {
-		next_pkt = pkt->next;
-		free(pkt->data);
-		free(pkt);
-		pkt = next_pkt;
-	}
-
-	free(s);
-	alc_session_list[s_id] = NULL;
-	nb_alc_session--;
+  /* Closing, free all uncompleted objects, uncompleted fdt instances and wanted obj list */
+  
+  to = s->obj_list;
+  
+  while(to != NULL) {
+    free_object(to, s, 1);
+    to = s->obj_list;
+  }
+  
+  to = s->fdt_list;
+  
+  while(to != NULL) {
+    free_object(to, s, 0);
+    to = s->fdt_list;
+  }
+  
+  want = s->wanted_obj_list;
+  
+  while(want != NULL) {
+    next_want = want->next;
+    free(want);
+    want = next_want;
+  } 	
+  
+  instance = s->rx_fdt_instance_list;
+  
+  while(instance != NULL) {
+    next_instance = instance->next;
+    free(instance);
+    instance = next_instance;
+  }
+    
+  if(s->cc_id == RLC) {
+    close_mad_rlc(s);
+  }
+  
+  pkt = s->tx_queue_begin;
+  
+  while(pkt != NULL) {
+    next_pkt = pkt->next;
+    free(pkt->data);
+    free(pkt);
+    pkt = next_pkt;
+  }
+  
+  free(s);
+  alc_session_list[s_id] = NULL;
+  nb_alc_session--;
+  unlock_session();
 }
-
-/*
- * This function returns session from session_list.
- *
- * Params: int s_id: Session identifier
- *
- * Return: alc_session_t*: Pointer to session, NULL if session does not exist.
- *
- */
 
 alc_session_t* get_alc_session(int s_id) {
 
-	return alc_session_list[s_id];	
+  alc_session_t* alc_session;
+
+  lock_session();
+  assert (alc_session_list != NULL);
+  assert (s_id >= 0);
+  assert (s_id < MAX_ALC_SESSIONS);
+  alc_session = alc_session_list[s_id];
+
+  unlock_session();
+
+  return alc_session;
 }
 
-/*
- * This function returns state of session.
- *
- * Params:	int s_id: Session identifier
- *
- * Return:	int: State of the session, -1 if session does not exist anymore.
- *
- */
+
+int add_alc_channel(int s_id, const char *port, const char *addr, const char *intface, const char *intface_name) {
+	
+  alc_channel_t *ch;
+  alc_session_t *s;
+  int ret;
+
+  lock_session();
+  ch = NULL;
+  s = alc_session_list[s_id];
+
+  if(s->nb_channel >= s->max_channel) {
+    /* Could not add new alc channel to alc session */
+    printf("Could not create new alc channel: Max number of channels already used!\n");
+    unlock_session();
+    return -1;
+  }
+
+  ret = open_alc_channel(ch, s, port, addr, intface, intface_name, s->def_tx_rate);
+  unlock_session();
+
+  return ret;
+}
+
+void remove_alc_channels(int s_id) {
+
+  alc_session_t *s;
+  alc_channel_t *ch;
+  int i;
+
+  lock_session();
+  s = alc_session_list[s_id];
+
+  for(i = 0; i < s->max_channel; i++) {
+
+    if(s->ch_list[i] != NULL) {
+      ch = s->ch_list[i];
+      close_alc_channel(ch, s);
+    }
+  }
+
+  unlock_session();
+}
+
+trans_obj_t* get_session_obj_list(int s_id) {
+
+  trans_obj_t* obj_list;
+
+  lock_session();
+  obj_list = alc_session_list[s_id]->obj_list;
+  unlock_session();
+
+  return obj_list;
+}
+
+trans_obj_t* get_session_fdt_list(int s_id) {
+
+  trans_obj_t* fdt_list;
+
+  lock_session();
+  fdt_list = alc_session_list[s_id]->fdt_list;
+  unlock_session();
+
+  return fdt_list;
+}
+
+wanted_obj_t* get_session_wanted_obj_list(int s_id) {
+
+  wanted_obj_t* wanted_obj_list;
+
+  lock_session();
+  wanted_obj_list = alc_session_list[s_id]->wanted_obj_list;
+  unlock_session();
+
+  return wanted_obj_list;
+}
 
 int get_session_state(int s_id) {
-	
-	if(alc_session_list[s_id] == NULL) {
-		return -1;
-	}
+  int state;
 
-	return alc_session_list[s_id]->state;
+  lock_session();
+
+  if(alc_session_list[s_id] == NULL) {
+    unlock_session();
+    return -1;
+  }
+
+  state = alc_session_list[s_id]->state;
+  unlock_session();
+  return state;
 }
-
-/*
- * This function sets state of session.
- *
- * Params:	int s_id: Session identifier,
- *			enum alc_session_states state: New session state
- *
- * Return:	void
- *
- */
 
 void set_session_state(int s_id, enum alc_session_states state) {
-	
-	alc_session_list[s_id]->state = state;
+  lock_session();
+  alc_session_list[s_id]->state = state;
+  unlock_session();
 }
 
-/*
- * This function returns state of A flag in session.
- *
- * Params:	int s_id: Session identifier
- *
- * Return:	int: State of A flag (0 = not set, 1 = set)
- *
- */
+void set_all_sessions_state(enum alc_session_states state) {
 
-int get_session_a_flag(int s_id) {
-	
-	return alc_session_list[s_id]->a_flag;
+  int i;
+  lock_session();
+
+  for(i = 0; i < MAX_ALC_SESSIONS; i++)
+    {
+      if(alc_session_list[i] != NULL)
+        {
+	  alc_session_list[i]->state = state;
+        }
+    }
+  unlock_session();
 }
 
-/*
- * This function sets state of A flag in session.
- *
- * Params:	int s_id: Session identifier
- *
- * Return:	void
- *
- */
+int get_session_a_flag_usage(int s_id) {
 
-void set_session_a_flag(int s_id) {
-	
-	alc_session_list[s_id]->a_flag = 1;
+  int flag;
+  lock_session();
+  flag = alc_session_list[s_id]->a_flag;
+  unlock_session();
+
+  return flag;
 }
 
-/*
- * This function returns session's FDT Instance ID.
- *
- * Params:	int s_id: Session identifier
- *
- * Return:	unsigned int: Session's FDT Instance ID
- *
- */
+void set_session_a_flag_usage(int s_id) {
+
+  lock_session();
+  alc_session_list[s_id]->a_flag = 1;
+  unlock_session();
+}
 
 unsigned int get_fdt_instance_id(int s_id) {
 
-	return alc_session_list[s_id]->fdt_instance_id;
-}
+  int instance_id;
 
-/* 
- * This function sets session's FDT Instance ID.
- *
- * Params:	int s_id: Session identifier,
- *			unsigned int: FDT Instance ID to be set
- *
- * Return:	void
- *
- */
+  lock_session();
+  instance_id = alc_session_list[s_id]->fdt_instance_id;
+  unlock_session();
+
+  return instance_id;
+}
 
 void set_fdt_instance_id(int s_id, unsigned int instance_id) {
-
-	alc_session_list[s_id]->fdt_instance_id =  (instance_id & 0x00FFFFFF);
+  lock_session();
+  alc_session_list[s_id]->fdt_instance_id =  (instance_id & 0x00FFFFFF);
+  unlock_session();
 }
 
-/*
- * This function returns number of bytes sent in session since latest zeroing.
- *
- * Params:	int s_id: Session identifier
- *
- * Return:	ULONGLONG/unsigned long long: Number of bytes sent in session since latest zeroing
- *
- */
-   
-#ifdef WIN32
-ULONGLONG get_session_sent_bytes(int s_id) {
-#else
+void set_fdt_instance_parsed(int s_id) {
+  lock_session();
+  alc_session_list[s_id]->waiting_fdt_instance = FALSE;
+  unlock_session();
+}
+
 unsigned long long get_session_sent_bytes(int s_id) {
-#endif
-                                                                                                                     
-        return alc_session_list[s_id]->sent_bytes;
-}
-                                                                                                                                       
-/*
- * This function sets number of bytes sent in session.
- *
- * Params:	int s_id: Session identifier,
- *			unsigned int sent_bytes: Bytes sent
- *
- * Return:	void
- *
- */
-                                                                                                                                       
-void set_session_sent_bytes(int s_id, unsigned int sent_bytes) {
-                                                                                                                                       
-        alc_session_list[s_id]->sent_bytes = sent_bytes;
+  unsigned long long byte_sent;
+
+  lock_session();
+  byte_sent = alc_session_list[s_id]->sent_bytes;
+  unlock_session();
+
+  return byte_sent;
 }
 
-/*
- * This function adds sent bytes in session.
- *
- * Params:	int s_id: Session identifier,
- *			unsigned int sent_bytes: Bytes sent
- *
- * Return:	void
- *
- */
-                                                                                                                                       
+void set_session_sent_bytes(int s_id, unsigned long long sent_bytes) {
+
+  lock_session();
+  alc_session_list[s_id]->sent_bytes = sent_bytes;
+  unlock_session();
+}
+
 void add_session_sent_bytes(int s_id, unsigned int sent_bytes) {
-                                                                                                                                       
-        alc_session_list[s_id]->sent_bytes += sent_bytes;
+
+  lock_session();
+  alc_session_list[s_id]->sent_bytes += sent_bytes;
+  unlock_session();
 }
 
+unsigned long long get_object_sent_bytes(int s_id) {
+  unsigned long long byte_sent;
 
-/*
- * This function adds channel to session.
- *
- * Params:	int s_id: Session identifier,
- *			char *port: Pointer to port string,
- *			char *addr: Pointer to address string,
- *			char *intface: Pointer to interface string,
- *			char *intface_name: Pointer to the interface name.
- *
- * Return:	int: Identifier for created channel in success, -1 otherwise
- *
- */
+  lock_session();
+  byte_sent = alc_session_list[s_id]->obj_sent_bytes;
+  unlock_session();
 
-int add_alc_channel(int s_id, char *port, char *addr, char *intface, char *intface_name) {
+  return byte_sent;
+}
+
+ void set_object_sent_bytes(int s_id, unsigned long long sent_bytes) {
+
+   lock_session();
+   alc_session_list[s_id]->obj_sent_bytes = sent_bytes;
+   unlock_session();
+ }
+
+void add_object_sent_bytes(int s_id, unsigned int sent_bytes) {
+
+  lock_session();
+  alc_session_list[s_id]->obj_sent_bytes += sent_bytes;
+  unlock_session();
+}
+
+double get_object_last_print_tx_percent(int s_id) {                                                                                                                   
+  double tx_percent;
+
+  lock_session();
+  tx_percent = alc_session_list[s_id]->last_print_tx_percent;
+  unlock_session();
+
+  return tx_percent;
+}
+                                                                                                                                          
+void set_object_last_print_tx_percent(int s_id, double last_print_tx_percent) {                                                                                  
+  lock_session();
+  alc_session_list[s_id]->last_print_tx_percent = last_print_tx_percent;
+  unlock_session();
+}
+
+void set_session_tx_toi(int s_id, unsigned long long toi) {
+
+  lock_session();
+  alc_session_list[s_id]->tx_toi = toi;
+  unlock_session();
+}
+
+unsigned long long get_session_tx_toi(int s_id) {
+
+  unsigned long long tx_toi;
+
+  lock_session();
+  tx_toi = alc_session_list[s_id]->tx_toi;
+  unlock_session();
+
+  return tx_toi;
+}
+
+void update_session_tx_rate(int s_id, int base_tx_rate) {
+	alc_session_t *s;
+	alc_channel_t *ch;
+	int i;
+
+	lock_session();
+	s = alc_session_list[s_id];
 	
-	alc_channel_t *ch = NULL;
+	for(i = 0; i < s->max_channel; i++) {
+		if(s->ch_list[i] != NULL) {
+			ch = s->ch_list[i];
 
-	alc_session_t *s = alc_session_list[s_id];
-	
-	if(s->nb_channel >= s->max_channel) {
-		/* Could not add new alc channel to alc session */
-		/* printf("Could not create new alc channel: Max number of channels already used!\n");*/
-		return -1;
+			if(ch->ch_id == 0) {
+        			ch->tx_rate = base_tx_rate;
+        			ch->nb_tx_units = 1;
+			}
+			else {
+				ch->tx_rate = base_tx_rate * (int)pow(2.0, (double)(ch->ch_id - 1));
+				ch->nb_tx_units = (int)pow(2.0, (double)(ch->ch_id - 1));
+			}
+			printf("new rate [channel: %i]: %i\n", ch->ch_id, ch->tx_rate);
+		}
 	}
-
-	return open_alc_channel(ch, s, port, addr, intface, intface_name, s->def_tx_rate);
+	unlock_session();
 }
 
-/*
- * This function removes channel from session.
- *
- * Params:	int s_id: Session Identifier,
- *			int ch_id: Channel Identifier
- *
- * Return:	int: 0 in success, -1 otherwise
- *
- */
+wanted_obj_t* get_wanted_object(alc_session_t *s, unsigned long long toi) {
 
-int remove_alc_channel(int s_id, int ch_id) {
-	alc_session_t *s = alc_session_list[s_id];
-	alc_channel_t *ch = s->ch_list[ch_id];
-	
-	return close_alc_channel(ch, s);
-}
-
-/*
- * This function set object wanted from session.
- *
- * Params:	int s_id: Session Identifier,
- *			ULONGLONG/unsigned long long  toi: Transport Object Identifier,
- *			ULONGLONG/unsigned long long toi_len: Object length,
- *			unsigned short eslen: Encoding Symbol Length,
- *			unsigned int max_sblen: Full-Size Source Block Length,
- *			int fec_inst_id: FEC Instance ID,
- *			short fec_enc_id: FEC Encoding ID,
- *			unsigned short max_nb_of_enc_symb:,
- *			unsigned char content_enc_algo:.
- *
- * Return:	int: 0 in success, -1 otherwise
- *
- */
-
-int set_wanted_object(int s_id,
-#ifdef WIN32
-		ULONGLONG toi,
-        ULONGLONG toi_len,
-#else
-		unsigned long long toi,
-        unsigned long long toi_len,
-#endif
-		unsigned short eslen, unsigned int max_sblen, int fec_inst_id,
-		short fec_enc_id, unsigned short max_nb_of_enc_symb
-
-#ifdef USE_ZLIB
-		,unsigned char content_enc_algo) {
-#else 
-	) {
-#endif
-	
-	alc_session_t *s = alc_session_list[s_id];
-	wanted_obj_t *wanted_obj;
 	wanted_obj_t *tmp;
+
+	lock_session();
 
 	tmp = s->wanted_obj_list;
 
-	if(tmp == NULL) {
-
-		if (!(wanted_obj = (wanted_obj_t*)calloc(1, sizeof(wanted_obj_t)))) {
-			printf("Could not alloc memory for wanted object!\n");
-			return -1;
-		}
-
-		wanted_obj->toi = toi;
-		wanted_obj->toi_len = toi_len;
-		wanted_obj->eslen = eslen;
-		wanted_obj->max_sblen = max_sblen;
-		wanted_obj->fec_inst_id = fec_inst_id;
-		wanted_obj->fec_enc_id = fec_enc_id;
-		wanted_obj->max_nb_of_enc_symb = max_nb_of_enc_symb;
-
-#ifdef USE_ZLIB
-		wanted_obj->content_enc_algo = content_enc_algo;
-#endif
-		
-		wanted_obj->prev = NULL;
-		wanted_obj->next = NULL;
-
-		s->wanted_obj_list = wanted_obj;
-	}
-	else {
-		for(;; tmp = tmp->next) {
-			if(tmp->toi == toi) {
-				break;
-			}
-			else if(tmp->next == NULL) {
-
-				if (!(wanted_obj = (wanted_obj_t*)calloc(1, sizeof(wanted_obj_t)))) {
-					printf("Could not alloc memory for wanted object!\n");
-					return -1;
-				}
-
-				wanted_obj->toi = toi;
-				wanted_obj->toi_len = toi_len;
-				wanted_obj->eslen = eslen;
-				wanted_obj->max_sblen = max_sblen;
-				wanted_obj->fec_inst_id = fec_inst_id;
-				wanted_obj->fec_enc_id = fec_enc_id;
-				wanted_obj->max_nb_of_enc_symb = max_nb_of_enc_symb;
-
-#ifdef USE_ZLIB
-				wanted_obj->content_enc_algo = content_enc_algo;
-#endif
-
-				tmp->next = wanted_obj;
-				wanted_obj->prev = tmp;
-				wanted_obj->next = NULL;
-				break;
-			}
-		}
-	}
-
-	return 0;
-}
-
-/*
- * This function checks if object identified with TOI is wanted and returns pointer to wanted object structure.
- *
- * Params:	alc_session_t *s: Pointer to Session,
- *			ULONGLONG/unsigned long long toi: Transport Object Identifier to be checked
- *
- * Return:	wanted_obj_t*: Pointer to wanted object structure in success, NULL otherwise
- *
- */
-
-wanted_obj_t* get_wanted_object(alc_session_t *s,
-								
-#ifdef WIN32
-								ULONGLONG toi) {
-#else
-								unsigned long long toi) {
-#endif
-
-	wanted_obj_t *tmp = s->wanted_obj_list;
-		
 	while(tmp != NULL) {
 		if(tmp->toi == toi) {
-			return tmp;
+		  unlock_session();
+		  return tmp;
 		}
 		tmp = tmp->next;
 	}
 
+	unlock_session();
 	return NULL;
 }
 
-/*
- * This function removes wanted object identified with toi from the session.
- *
- * Params:      int s_id: Session Identifier,
- *              ULONGLONG/unsigned long long toi: Transport Object Identifier
- *
- * Return:      void
- *
- */
+int set_wanted_object(int s_id, unsigned long long toi,
+		      unsigned long long transfer_len,
+		      unsigned short es_len, unsigned int max_sb_len, int fec_inst_id,
+		      short fec_enc_id, unsigned short max_nb_of_es,
+		      unsigned char content_enc_algo, unsigned char finite_field,
+			  unsigned char nb_of_es_per_group) {
+	
+  alc_session_t *s;
+  wanted_obj_t *wanted_obj;
+  wanted_obj_t *tmp;
+  
+  lock_session();
+   
+  s = alc_session_list[s_id];
+  tmp = s->wanted_obj_list;
+  
+  if(tmp == NULL) {
+    
+    if (!(wanted_obj = (wanted_obj_t*)calloc(1, sizeof(wanted_obj_t)))) {
+      printf("Could not alloc memory for wanted object!\n");
+      unlock_session();
+      return -1;
+    }
+    
+    wanted_obj->toi = toi;
+    wanted_obj->transfer_len = transfer_len;
+    wanted_obj->es_len = es_len;
+    wanted_obj->max_sb_len = max_sb_len;
+    wanted_obj->fec_inst_id = fec_inst_id;
+    wanted_obj->fec_enc_id = fec_enc_id;
+    wanted_obj->max_nb_of_es = max_nb_of_es;
+    wanted_obj->content_enc_algo = content_enc_algo;
+	wanted_obj->finite_field = finite_field;
+	wanted_obj->nb_of_es_per_group = nb_of_es_per_group;
 
-void remove_wanted_object(int s_id,
-#ifdef WIN32
-						  ULONGLONG toi) {
-#else
-						  unsigned long long toi) {
-#endif
+    wanted_obj->prev = NULL;
+    wanted_obj->next = NULL;
+
+    s->wanted_obj_list = wanted_obj;
+  }
+  else {
+    for(;; tmp = tmp->next) {
+      if(tmp->toi == toi) {
+	break;
+      }
+      else if(tmp->next == NULL) {
+	
+	if (!(wanted_obj = (wanted_obj_t*)calloc(1, sizeof(wanted_obj_t)))) {
+	  printf("Could not alloc memory for wanted object!\n");
+	  unlock_session();
+	  return -1;
+	}
+	
+	wanted_obj->toi = toi;
+	wanted_obj->transfer_len = transfer_len;
+	wanted_obj->es_len = es_len;
+	wanted_obj->max_sb_len = max_sb_len;
+	wanted_obj->fec_inst_id = fec_inst_id;
+	wanted_obj->fec_enc_id = fec_enc_id;
+	wanted_obj->max_nb_of_es = max_nb_of_es;
+	wanted_obj->content_enc_algo = content_enc_algo;
+	wanted_obj->finite_field = finite_field;
+	wanted_obj->nb_of_es_per_group = nb_of_es_per_group;
+	
+	tmp->next = wanted_obj;
+	wanted_obj->prev = tmp;
+	wanted_obj->next = NULL;
+
+	break;
+      }
+    }
+  }
+  
+  unlock_session();
+  return 0;
+}
+
+void remove_wanted_object(int s_id, unsigned long long toi) {
 
 	alc_session_t *s; 	
 	wanted_obj_t *next_want;
 	wanted_obj_t *want;
 	
-	s = get_alc_session(s_id);
+	lock_session();
+
+	s = alc_session_list[s_id];
 	next_want = s->wanted_obj_list;
 
 	while(next_want != NULL) {
@@ -706,81 +818,18 @@ void remove_wanted_object(int s_id,
 	    	}
 	    	next_want = want->next;
 	}
+
+	unlock_session();
 }
-
-/*
- * This function sets FDT Instance to received list
- *
- * Params:	alc_session_t *s: Pointer to Session,
- *			unsigned int fdt_instance_id: FDT Instance ID to be set,
- *
- * Return:	int: 0 in success, -1 otherwise
- *
- */
-
-int set_received_instance(alc_session_t *s, unsigned int fdt_instance_id) {
- 
-        rx_fdt_instance_t *rx_fdt_instance;
-        rx_fdt_instance_t *list;
                                                                                                                                               
-        list = s->rx_fdt_instance_list;
+BOOL is_received_instance(alc_session_t *s, unsigned int fdt_instance_id) {
                                                                                                                                               
-        if(list == NULL) {
-                                                                                                                                              
-                if (!(rx_fdt_instance = (rx_fdt_instance_t*)calloc(1, sizeof(rx_fdt_instance_t)))) {
-                        printf("Could not alloc memory for rx_fdt_instance!\n");
-                        return -1;
-                }
-
-                rx_fdt_instance->fdt_instance_id = fdt_instance_id;
-                rx_fdt_instance->prev = NULL;
-                rx_fdt_instance->next = NULL;
-        
-		s->rx_fdt_instance_list = rx_fdt_instance;
-        }
-        else {
-                for(;; list = list->next) {
-                        if(list->fdt_instance_id == fdt_instance_id) {
-                                break;
-                        }
-                        else if(list->next == NULL) {
-              
-							if (!(rx_fdt_instance = (rx_fdt_instance_t*)calloc(1, sizeof(rx_fdt_instance_t)))) {
-                					printf("Could not alloc memory for rx_fdt_instance!\n");
-                        			return -1;
-                			}
-		 
-							rx_fdt_instance->fdt_instance_id = fdt_instance_id;
-                                                                                                                                              
-							list->next = rx_fdt_instance;
-							rx_fdt_instance->prev = list;
-							rx_fdt_instance->next = NULL;
-							break;
-                        }
-                }
-        }
-                                                                                                                                              
-        return 0;
-}
-
-/*
- * This function checks if FDT Instance is already received
- *
- * Params:	alc_session_t *s: Pointer to Session,
- *			unsigned int fdt_instance_id: FDT Instance ID to be checked
- *
- * Return:	bool: true if received, false otherwise
- *
- */
-                                                                                                                                              
-bool is_received_instance(alc_session_t *s, unsigned int fdt_instance_id) {
-                                                                                                                                              
-        bool retval = false;
+        BOOL retval = FALSE;
         rx_fdt_instance_t *list = s->rx_fdt_instance_list;
                                                                                                                                               
         while(list != NULL) {
                 if(list->fdt_instance_id == fdt_instance_id) {
-                        retval = true;
+                        retval = TRUE;
                         break;
                 }
                 list = list->next;
@@ -789,23 +838,82 @@ bool is_received_instance(alc_session_t *s, unsigned int fdt_instance_id) {
         return retval;
 }
 
+int set_received_instance(alc_session_t *s, unsigned int fdt_instance_id) {
+ 
+        rx_fdt_instance_t *rx_fdt_instance;
+        rx_fdt_instance_t *list;
+        
+	lock_session();
 
-/*
- * This function returns session's base directory.
- *
- * Params:	int s_id: Session identifier,
- *
- * Return:	char*: Pointer to base directory.
- *
- */
+        list = s->rx_fdt_instance_list;
+                                                                                                                                              
+        if(list == NULL) {
+                                                                                                                                              
+                if (!(rx_fdt_instance = (rx_fdt_instance_t*)calloc(1, sizeof(rx_fdt_instance_t)))) {
+                        printf("Could not alloc memory for rx_fdt_instance!\n");
+			unlock_session();
+                        return -1;
+                }
+
+                rx_fdt_instance->fdt_instance_id = fdt_instance_id;
+                rx_fdt_instance->prev = NULL;
+                rx_fdt_instance->next = NULL;
+        
+			s->rx_fdt_instance_list = rx_fdt_instance;
+        }
+        else {
+                for(;; list = list->next) {
+                        if(list->fdt_instance_id == fdt_instance_id) {
+                                break;
+                        }
+                        else if(list->next == NULL) {
+              
+							  if (!(rx_fdt_instance = (rx_fdt_instance_t*)calloc(1, sizeof(rx_fdt_instance_t)))) {
+								printf("Could not alloc memory for rx_fdt_instance!\n");
+								unlock_session();
+								return -1;
+							  }
+			  
+							  rx_fdt_instance->fdt_instance_id = fdt_instance_id;
+							  
+							  list->next = rx_fdt_instance;
+							  rx_fdt_instance->prev = list;
+							  rx_fdt_instance->next = NULL;
+
+							  break;
+                        }
+                }
+        }
+	
+	unlock_session();
+        return 0;
+}
 
 char* get_session_basedir(int s_id) {
 
-	alc_session_t *s; 	
-	
-	s = get_alc_session(s_id);
+  alc_session_t *s;
+  char* base_dir;
 
-	return s->base_dir;
+  lock_session();
+
+  s = alc_session_list[s_id];
+  base_dir = s->base_dir;
+
+  unlock_session();
+
+  return base_dir;
 }
 
+void initialize_session_handler() {
+#ifdef _MSC_VER
+  InitializeCriticalSection(&session_variables_semaphore);
+#else
+#endif
+}
 
+void release_session_handler() {
+#ifdef _MSC_VER
+  DeleteCriticalSection(&session_variables_semaphore);
+#else
+#endif
+}

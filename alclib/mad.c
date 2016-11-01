@@ -1,74 +1,83 @@
-/* $Author: peltotal $ $Date: 2004/04/27 06:54:40 $ $Revision: 1.6 $ */
-/*
- *   MAD-ALC, implementation of ALC/LCT protocols
- *   Copyright (c) 2003-2004 TUT - Tampere University of Technology
- *   main authors/contacts: jani.peltotalo@tut.fi and sami.peltotalo@tut.fi
+/** \file mad.c \brief General ALC stuff
  *
- *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 2 of the License, or
- *   (at your option) any later version.
+ *  $Author: peltotal $ $Date: 2007/02/28 08:58:00 $ $Revision: 1.27 $
  *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
+ *  MAD-ALCLIB: Implementation of ALC/LCT protocols, Compact No-Code FEC,
+ *  Simple XOR FEC, Reed-Solomon FEC, and RLC Congestion Control protocol.
+ *  Copyright (c) 2003-2007 TUT - Tampere University of Technology
+ *  main authors/contacts: jani.peltotalo@tut.fi and sami.peltotalo@tut.fi
  *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, write to the Free Software
- *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ *  In addition, as a special exception, TUT - Tampere University of Technology
+ *  gives permission to link the code of this program with the OpenSSL library (or
+ *  with modified versions of OpenSSL that use the same license as OpenSSL), and
+ *  distribute linked combinations including the two. You must obey the GNU
+ *  General Public License in all respects for all of the code used other than
+ *  OpenSSL. If you modify this file, you may extend this exception to your version
+ *  of the file, but you are not obligated to do so. If you do not wish to do so,
+ *  delete this exception statement from your version.
  */
 
-#include "inc.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
+#include <string.h>
 
-/**** Set global variables ****/
+#ifdef _MSC_VER
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <sys/time.h>
+#endif
 
-bool lib_init = false;
+#include "mad.h"
 
-/**** Local global variables ****/
+/* Initialize global variable */
 
-#ifdef WIN32
-double time_factor;
-LONGLONG start_time;
-#endif /* WIN32 */
+BOOL lib_init = FALSE;
 
-/**** Private functions ****/
+#ifdef _MSC_VER
+double time_factor;				/**< local global variable for timer */
+unsigned long long start_time;	/**< local global variable for timer */
+#endif
 
-void char_to_ushort(char c, unsigned short *target, int point);
-
-#ifdef WIN32
-void sec_init(void);
-#endif /* WIN32 */
-
-#ifdef WIN32
-
-/*
+#ifdef _MSC_VER
+/**
  * This function initializes timer.
- *
- * Params:	void
- *
- * Return:	void
- *
  */
 
 void sec_init(void) {	
-	LONGLONG perf_cnt;
+	unsigned long long perf_cnt;
 	QueryPerformanceFrequency((LARGE_INTEGER*)&perf_cnt);
 	time_factor = 1.0/perf_cnt;
 	QueryPerformanceCounter((LARGE_INTEGER*)&start_time);
 }
+#endif
 
-/*
- * This function return number of seconds since sec_init was called.
- *
- * Params:	void
- *
- * Return: double: 	Time since sec_init was called
- *
- */
+void alc_init(void) {
 
+#ifdef _MSC_VER
+	sec_init(); /* Initialize timer */
+#endif
+	lib_init = TRUE;
+}
+
+#ifdef _MSC_VER
 double sec(void) {	
-	LONGLONG cur_time;
+	long long cur_time;
 	double time_span;         
 	QueryPerformanceCounter((LARGE_INTEGER*)&cur_time);
 
@@ -76,194 +85,126 @@ double sec(void) {
 	return time_span;
 }	
 #else
-
-/*
- * This function return number of seconds since sec_init was called.
- *
- * Params:	void
- *
- * Return: double: 	Time since sec_init was called
- *
- */
-
 double sec(void) {
 
 	struct timeval tv;
 	gettimeofday(&tv, 0);
 	return tv.tv_sec + tv.tv_usec / 1000000.0;
 }
+#endif
 
-#endif /* WIN32 */
+int increase_ipv6_address(struct in6_addr *ipv6) { 
+ 
+  if(ipv6->s6_addr[15] != 0xFF) { 
+    ipv6->s6_addr[15]++; 
+  } 
+  else if(ipv6->s6_addr[14] != 0xFF) { 
+    ipv6->s6_addr[15] = 0; 
+    ipv6->s6_addr[14]++; 
+  } 
+  else if(ipv6->s6_addr[13] != 0xFF) { 
+    ipv6->s6_addr[13]++; 
+  } 
+  else if(ipv6->s6_addr[12] != 0xFF) { 
+    ipv6->s6_addr[13] = 0; 
+    ipv6->s6_addr[12]++; 
+  } 
+  else if(ipv6->s6_addr[11] != 0xFF) { 
+    ipv6->s6_addr[11]++; 
+  } 
+  else if(ipv6->s6_addr[10] != 0xFF) { 
+    ipv6->s6_addr[11] = 0; 
+    ipv6->s6_addr[10]++; 
+  } 
+  else if(ipv6->s6_addr[9] != 0xFF) { 
+    ipv6->s6_addr[9]++; 
+  } 
+  else if(ipv6->s6_addr[8] != 0xFF) { 
+    ipv6->s6_addr[9] = 0; 
+    ipv6->s6_addr[8]++; 
+  } 
+  else if(ipv6->s6_addr[7] != 0xFF) { 
+    ipv6->s6_addr[7]++; 
+  } 
+  else if(ipv6->s6_addr[6] != 0xFF) { 
+    ipv6->s6_addr[7] = 0; 
+    ipv6->s6_addr[6]++; 
+  } 
+  else if(ipv6->s6_addr[5] != 0xFF) { 
+    ipv6->s6_addr[5]++; 
+  } 
+  else if(ipv6->s6_addr[4] != 0xFF) { 
+    ipv6->s6_addr[5] = 0; 
+    ipv6->s6_addr[4]++; 
+  } 
+  else if(ipv6->s6_addr[3] != 0xFF) { 
+    ipv6->s6_addr[3]++; 
+  } 
+  else if(ipv6->s6_addr[2] != 0xFF) { 
+    ipv6->s6_addr[3] = 0; 
+    ipv6->s6_addr[2]++; 
+  } 
+  else if(ipv6->s6_addr[1] != 0xFF) { 
+    ipv6->s6_addr[1]++; 
+  } 
+  else if(ipv6->s6_addr[0] != 0xFF) { 
+    ipv6->s6_addr[1] = 0; 
+    ipv6->s6_addr[0]++; 
+  } 
+  else { 
+    return -1; 
+  } 
+   
+  return 0; 
+} 
 
-/*
- * This function initialize library
- *
- * Params:	void
- *
- * Return:	void
- *
- */
+int randomloss(double lossprob) {
+	
+	int loss = 0;
 
-void alc_init(void) {
+	double msb;
+	double lsb;
 
-#ifdef WIN32
-	sec_init(); /* Initialize timer */
-#endif /* WIN32 */
-	lib_init = true;
+	double tmp;
+
+	if(lossprob == 0.0) {
+		return loss;
+	}
+	
+	msb = (double)(rand()%100);
+	lsb = (double)(rand()%10);
+	
+	tmp = msb + (double)(lsb/(double)10);
+
+	if(tmp < lossprob) {
+		loss = 1;
+	}
+	
+	return loss;
 }
 
-/*
- * This function converts character to unsigned short and adds that value to target.
- *
- * Params:	char c: Character to be converted,
- *			unsigned short *target: Pointer where to convert,
- *			int point: Character place in four character string
- *
- * Return:	void
- *
- */
 
-void char_to_ushort(char c, unsigned short *target, int point) {
+#ifdef _MSC_VER
 
-	if(c == '0') {
-		*target += 0x0 << (point * 4);
-	}
-	else if(c == '1') {
-		*target += 0x1 << (point * 4);
-	}
-	else if(c == '2') {
-		*target += 0x2 << (point * 4);
-	}
-	else if(c == '3') {
-		*target += 0x3 << (point * 4);
-	}
-	else if(c == '4') {
-		*target += 0x4 << (point * 4);
-	}
-	else if(c == '5') {
-		*target += 0x5 << (point * 4);
-	}
-	else if(c == '6') {
-		*target += 0x6 << (point * 4);
-	}	
-	else if(c == '7') {
-		*target += 0x7 << (point * 4);
-	}
-	else if(c == '8') {
-		*target += 0x8 << (point * 4);
-	}
-	else if(c == '9') {
-		*target += 0x9 << (point * 4);
-	}
-	else if(((c == 'a') || (c == 'A'))) {
-		*target += 0xa << (point * 4);
-	}
-	else if(((c == 'b') || (c == 'B'))) {
-		*target += 0xb << (point * 4);
-	}
-	else if(((c == 'c') || (c == 'C'))) {
-		*target += 0xc << (point * 4);
-	}
-	else if(((c == 'd') || (c == 'D'))) {
-		*target += 0xd << (point * 4);
-	}
-	else if(((c == 'e') || (c == 'E'))) {
-		*target += 0xe << (point * 4);
-	}
-	else if(((c == 'f') || (c == 'F'))) {
-		*target += 0xf << (point * 4);
-	}
+lldiv_t lldiv(long long num, long long denom) {
+  lldiv_t r;
+
+  if (num > 0 && denom < 0) {
+    num = -num;
+    denom = -denom;
+  }
+
+  r.quot = num / denom;
+  r.rem = num % denom;
+
+  if (num < 0 && denom > 0) {
+    if (r.rem > 0) {
+      r.quot++;
+      r.rem -= denom;
+    }
+  }
+  
+  return r;
 }
 
-/*
- * This function converts IPv6 hexa-address to IPv6 decimal-address.   
- *
- * Params:	char *ipv6: Pointer to IPv6 string to be converted,
- *			unsigned short *ipv6addr: Pointer where to convert,
- *			int *nb_ipv6_part: Number of parts in IPv6 string address.
- *
- * Return:	int: 0 in success, -1 in errors
- *
- */
-
-int ushort_ipv6addr(char *ipv6, unsigned short *ipv6addr, int *nb_ipv6_part) { 
-
-	char *ptr;
-	int point; 
-	int ch = ':';
-
-	char *tmp = NULL;
-
-	int i, j;
-
-	char c;
-	char first[5];
-	char second[40];
-
-	if(!(tmp = (char*)calloc((strlen(ipv6) + 1), sizeof(char)))) {
-		printf("Could not alloc memory for tmp!\n");
-		return -1;
-	}
-
-	memcpy(tmp, ipv6, strlen(ipv6));
-
-	ptr = strchr(tmp, ch);
-
-	for(*nb_ipv6_part = 0;;(*nb_ipv6_part)++) {
-
-		if(*nb_ipv6_part > 7) {
-			printf("Invalid IPv6 address!\n");
-			fflush(stdout);
-			free(tmp);
-			return -1;
-		}
-
-		*(ipv6addr + *nb_ipv6_part) = 0;
-
-		if(ptr == NULL) {
-
-			if(strlen(second) > 4) {
-				printf("Invalid IPv6 address!\n");
-				fflush(stdout);
-				free(tmp);
-				return -1;
-			}
-			
-			for(i = 0; i < (int)strlen(second); i++) {
-
-				c = second[i];
-				char_to_ushort(c, (ipv6addr + *nb_ipv6_part), ((int)strlen(second) - i - 1));
-			}
-
-			break;
-		}
-
-		memset(first, 0, 5);
-		memset(second, 0, 40);
-
-		point = (int)(ptr - tmp);
-
-		memcpy(first, tmp, point);
-		memcpy(second, (tmp + point + 1), (strlen(tmp) - (point + 1)));
-
-		strcpy(tmp, second);
-
-		if(strlen(first) > 4) {
-			printf("Invalid IPv6 address!\n");
-			fflush(stdout);
-			free(tmp);
-			return -1;
-		}
-
-		for(j = 0; j < (int)strlen(first); j++) {
-			
-			c = first[j];
-			char_to_ushort(c, (ipv6addr + *nb_ipv6_part), ((int)strlen(first) - j - 1));
-		}
-
-		ptr = strchr(tmp, ch);
-	}
-
-	free(tmp);
-	return 0;
-}
+#endif

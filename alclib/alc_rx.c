@@ -1,299 +1,151 @@
-/* $Author: peltotas $ $Date: 2004/12/22 12:17:36 $ $Revision: 1.48 $ */
-/*
- *   MAD-ALC, implementation of ALC/LCT protocols
- *   Copyright (c) 2003-2004 TUT - Tampere University of Technology
- *   main authors/contacts: jani.peltotalo@tut.fi and sami.peltotalo@tut.fi
+/** \file alc_rx.c \brief ALC level receiving
  *
- *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 2 of the License, or
- *   (at your option) any later version.
+ *  $Author: peltotal $ $Date: 2007/02/28 08:58:00 $ $Revision: 1.146 $
  *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
+ *  MAD-ALCLIB: Implementation of ALC/LCT protocols, Compact No-Code FEC,
+ *  Simple XOR FEC, Reed-Solomon FEC, and RLC Congestion Control protocol.
+ *  Copyright (c) 2003-2007 TUT - Tampere University of Technology
+ *  main authors/contacts: jani.peltotalo@tut.fi and sami.peltotalo@tut.fi
  *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, write to the Free Software
- *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ *  In addition, as a special exception, TUT - Tampere University of Technology
+ *  gives permission to link the code of this program with the OpenSSL library (or
+ *  with modified versions of OpenSSL that use the same license as OpenSSL), and
+ *  distribute linked combinations including the two. You must obey the GNU
+ *  General Public License in all respects for all of the code used other than
+ *  OpenSSL. If you modify this file, you may extend this exception to your version
+ *  of the file, but you are not obligated to do so. If you do not wish to do so,
+ *  delete this exception statement from your version.
  */
 
-#include "inc.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <errno.h>
+#include <string.h>
+#include <time.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <math.h>
+#include <assert.h>
 
-/**** Private functions ****/
-
-trans_obj_t* object_exist(
-#ifdef WIN32
-						  ULONGLONG toi,
+#ifdef _MSC_VER
+#include <winsock2.h>
+#include <process.h>
+#include <io.h>
 #else
-						  unsigned long long toi,
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <sys/time.h>
 #endif
-						  alc_session_t *s, int type);
 
-trans_block_t* block_exist(unsigned int sbn, trans_obj_t *trans_obj);
-int analyze_packet(char *data, int len, alc_channel_t *ch);
-bool object_completed(trans_obj_t *to);
-bool object_completed2(trans_obj_t *to);
-bool blocks_completed(trans_obj_t *to);
-bool block_ready_to_decode(trans_block_t *tb);
-int recv_packet(alc_session_t *s);
+#include "defines.h"
+#include "alc_rx.h"
+#include "alc_channel.h"
+#include "mad_rlc.h"
+#include "lct_hdr.h"
+#include "null_fec.h"
+#include "xor_fec.h"
+#include "rs_fec.h"
+#include "utils.h"
+#include "transport.h"
+#include "alc_list.h"
 
-/*  
- * This function receives packets from all channels in one session in thread.
- * 
- * Params:	void *s: Pointer to session	
+/**
+ * This is a private function which parses and analyzes an ALC packet.
  *
- * Return:	void
+ * @param data pointer to the ALC packet
+ * @param len length of packet
+ * @param ch pointer to the channel
  *
- */
-
-void* rx_thread(void *s) {
-	
-	alc_session_t *session;
-	int retval;
-
-	session = (alc_session_t *)s;
-
-	while(session->state == SActive) {
-		
-		if(session->nb_channel != 0) {
-			retval = recv_packet(session);
-		}
-
-#ifdef WIN32
-		Sleep(1);
-#else
-		usleep(1000);
-#endif
-
-	}
-
-	/*printf("Rx thread exit\n");
-	fflush(stdout);*/
-
-#ifdef WIN32
-	ExitThread(0);
-#else
-	pthread_exit(0);
-#endif
-}
-
-
-/* 
- * This function receives unit(s) from session's channels.
- * 
- * Params: alc_session_t *s: Pointer to session	
- *
- * Return: int: Number of correct packets received from ALC session
- * 
- */
-
-int recv_packet(alc_session_t *s) {
-	
-	char recvbuf[MAX_PACKET_LENGTH];
-	int recvlen;
-	int nb;
-	int i;
-	int retval;
-	int max_fd = 0;
-	int recv_pkts = 0;
-	fd_set rfds;
-	alc_channel_t *ch;
-	struct timeval tv;
-	struct sockaddr_storage from;
-	char hostname[100];
-
-#ifdef WIN32
-	int fromlen;
-#else
-	socklen_t fromlen;
-#endif
-
-	if(s->addr_family == PF_INET) {
-		fromlen = sizeof(struct sockaddr_in);
-	}
-	else if(s->addr_family == PF_INET6) {
-		fromlen = sizeof(struct sockaddr_in6);
-	}
-
-	memset(recvbuf, 0, MAX_PACKET_LENGTH);
-
-	FD_ZERO(&rfds);
-	tv.tv_sec = 1;
-	tv.tv_usec = 0;
-
-	for(i = 0; i < s->max_channel; i++) {
-		ch = s->ch_list[i];
-
-		if(ch != NULL) {
-			FD_SET(ch->rx_sock, &rfds);
-			max_fd = max((int)ch->rx_sock, max_fd);
-		}
-	}
-
-	nb = select((max_fd + 1), &rfds, NULL, NULL, &tv);
-
-	if(nb <= 0) {
-		return 0;
-	}
-
-	for(i = 0; i < s->max_channel; i++) {
-		ch = s->ch_list[i];
-
-		if(ch != NULL) {
-
-			memset((void *)&from, 0, sizeof(from));
-
-			if(FD_ISSET(ch->rx_sock, &rfds)) {
-
-				recvlen = recvfrom(ch->rx_sock, recvbuf, MAX_PACKET_LENGTH, 0,
-						   (struct sockaddr*)&from, &fromlen);
-
-				if(recvlen < 0) {
-
-					if(s->state == SExiting) {
-						/*printf("recv_packet() SExiting\n");
-						fflush(stdout);*/
-						return -2;
-					}
-					else if(s->state == SClosed) {
-						/*printf("recv_packet() SClosed\n");
-						fflush(stdout);*/
-						return 0;
-					}
-					else {
-	#ifdef WIN32
-						printf("recvfrom failed: %d\n", WSAGetLastError());
-						fflush(stdout);
-	#else
-						printf("recvfrom failed: %d\n", h_errno);
-	#endif
-						return -1;
-					}
-				}
-				
-				getnameinfo((struct sockaddr*)&from, fromlen, hostname, sizeof(hostname), NULL, 0, NI_NUMERICHOST);
-
-#ifdef FIXME_CHECK_SOURCE
-				if(strcmp(hostname, s->src_addr) != 0) {
-					printf("Packet to wrong session: wrong source: %s\n", hostname);
-					fflush(stdout);
-					continue;
-				}
-#endif
-
-				retval = analyze_packet(recvbuf, recvlen, ch);
-
-#ifdef USE_RLC
-				if(ch->s->cc_id == RLC) {
-
-					if(((ch->s->rlc->drop_highest_layer) && (ch->s->nb_channel != 1))) {
-
-						ch->s->rlc->drop_highest_layer = false;
-						close_alc_channel(ch->s->ch_list[ch->s->nb_channel - 1], ch->s);
-					}
-				}
-#endif
-
-				if(retval == HDR_ERROR) {
-					continue;
-				}
-				else if(retval == DUP_PACKET) {
-					continue;
-				}
-				else if(retval == MEM_ERROR) {
-					return -1;
-				}
-				
-				recv_pkts++;
-			}
-		}
-	}
-
-	return recv_pkts;
-}
-
-/*
- * This function parses and analyzes alc packet.
- *
- * Params:	char *data: Pointer to packet's data,
- *			int len: Length of packet's data,
- *			alc_channel_t *ch: Pointer to channel
- *
- * Return:	int: Status of packet (OK, EMPTY_PACKET, HDR_ERROR, MEM_ERROR, DUP_PACKET)
+ * @return status of packet [WAITING_FDT = 5, OK = 4, EMPTY_PACKET = 3, HDR_ERROR = 2,
+ *                          MEM_ERROR = 1, DUP_PACKET = 0]
  *
  */
 
 int analyze_packet(char *data, int len, alc_channel_t *ch) {
 
-	def_lct_hdr_t *def_lct_hdr;		
-	
-	int hdrlen = 0;			/* length of whole header */
-	int retval;
-	
-#ifdef WIN32
-	ULONGLONG tsi;
-	ULONGLONG toi;
-	ULONGLONG toilen;
-#else
-	unsigned long long tsi;
-	unsigned long long toi;
-	unsigned long long toilen;
-#endif
+	int retval = 0;
+	int hdrlen = 0;			/* length of whole FLUTE/ALC/LCT header */
+	int het = 0;
+	int hel = 0;
+	int exthdrlen = 0;
+	unsigned int word = 0;	
+	short fec_enc_id = 0; 
+	unsigned long long ull = 0;
+	unsigned long long block_len = 0;
+	unsigned long long pos = 0;
 
-	unsigned int sbn;
-	unsigned int esid;
+	/* LCT header upto CCI */
 
-	unsigned short eslen;
-	unsigned short sblen;
-	
-	unsigned int max_sblen;
-	unsigned short max_nb_of_es;
+	def_lct_hdr_t *def_lct_hdr = NULL; 
 
-	short fec_enc_id;
-	int fec_inst_id;
+	/* remaining LCT header fields*/
 
-	int fdt_instance_id;
-	unsigned short flute_version;
-	unsigned char cont_enc_algo = 0;
-	unsigned short reserved;
+	unsigned long long tsi = 0; /* TSI */
+	unsigned long long toi = 0; /* TOI */
 
-	unsigned int word;
+	/* EXT_FDT */
 
-#ifdef WIN32
-	ULONGLONG ull;
-#else
-	unsigned long long ull;
-#endif
+	unsigned short flute_version = 0; /* V */
+	int fdt_instance_id = 0; /* FDT Instance ID */
 
-	trans_obj_t	*trans_obj;
-	trans_block_t *trans_block;
-	trans_unit_t *trans_unit;
-	wanted_obj_t *wanted_obj;
+	/* EXT_CENC */
 
-	int	het;
-	int	hel;
-	int	exthdrlen;
+	unsigned char content_enc_algo = 0; /* CENC */
+	unsigned short reserved = 0; /* Reserved */ 
+
+	/* EXT_FTI */
+
+	unsigned long long transfer_len = 0; /* L */
+	unsigned char finite_field = 0; /* m */
+	unsigned char nb_of_es_per_group = 0; /* G */
+	unsigned short es_len = 0; /* E */
+	unsigned short sb_len = 0;
+	unsigned int max_sb_len = 0; /* B */
+	unsigned short max_nb_of_es = 0; /* max_n */
+	int fec_inst_id = 0; /* FEC Instance ID */
+
+	/* FEC Payload ID */
+
+	unsigned int sbn = 0;
+	unsigned int esi = 0;
+
+	trans_obj_t *trans_obj = NULL;
+	trans_block_t *trans_block = NULL;
+	trans_unit_t *trans_unit = NULL;
+	trans_unit_t *tu = NULL;
+	trans_unit_t *next_tu = NULL;
+	wanted_obj_t *wanted_obj = NULL;
 
 	char *buf = NULL;
 
-#ifdef WIN32
-	ULONGLONG block_len;
-	ULONGLONG pos;
-#else
-	unsigned long long block_len;
-	unsigned long long pos;
-#endif
+	char filename[MAX_PATH_LENGTH];
+	double rx_percent = 0;
 	
-	char filename[MAX_PATH];
-
+	unsigned short j = 0;
+	unsigned short nb_of_symbols = 0;
+	
 	if(len < (int)(sizeof(def_lct_hdr_t))) {
 		printf("analyze_packet: packet too short %d\n", len);
 		fflush(stdout);
 		return HDR_ERROR;
 	}
-	
+
 	def_lct_hdr = (def_lct_hdr_t*)data;
 
 	*(unsigned short*)def_lct_hdr = ntohs(*(unsigned short*)def_lct_hdr);
@@ -301,9 +153,9 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 	hdrlen += (int)(sizeof(def_lct_hdr_t));
 
 	if(def_lct_hdr->version != ALC_VERSION) {
-	  printf("ALC version: %i not supported!\n", def_lct_hdr->version);
-	  fflush(stdout);	
-	  return HDR_ERROR;
+		printf("ALC version: %i not supported!\n", def_lct_hdr->version);
+		fflush(stdout);	
+		return HDR_ERROR;
 	}
 
 	if(def_lct_hdr->reserved != 0) {
@@ -336,16 +188,14 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 	else {
 		if(def_lct_hdr->cci != 0) {
 
-#ifdef USE_RLC
 			if(ch->s->cc_id == RLC) {
 
 				retval = mad_rlc_analyze_cci(ch->s, (rlc_hdr_t*)(data + 4));
-				
+
 				if(retval < 0) {
 					return HDR_ERROR;
 				}
 			}
-#endif
 		}
 	}
 
@@ -356,9 +206,13 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 			hdrlen += 4;
 
 			tsi = (word & 0xFFFF0000) >> 16;
-	
+
 			if(tsi != ch->s->tsi) {
-				printf("Packet to wrong session: wrong TSI: %i\n", tsi);
+#ifdef _MSC_VER
+				printf("Packet to wrong session: wrong TSI: %I64u\n", tsi);
+#else
+				printf("Packet to wrong session: wrong TSI: %llu\n", tsi);
+#endif
 				fflush(stdout);
 				return HDR_ERROR;
 			}
@@ -373,19 +227,21 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 			hdrlen += 4;
 
 			tsi += (word & 0xFFFF0000) >> 16;
-		
+
 			if(tsi != ch->s->tsi) {
-				printf("Packet to wrong session: wrong TSI: %i\n", tsi);
+#ifdef _MSC_VER
+				printf("Packet to wrong session: wrong TSI: %I64u\n", tsi);
+#else
+				printf("Packet to wrong session: wrong TSI: %llu\n", tsi);
+#endif
 				fflush(stdout);
 				return HDR_ERROR;
 			}
 		}
 
-#ifdef FIXME_ZAP_SESSION_CLOSE
-                if(def_lct_hdr->flag_a == 1) {
-                        ch->s->state = STxStopped;
-                }
-#endif
+		if(def_lct_hdr->flag_a == 1) {
+			ch->s->state = SAFlagReceived;
+		}
 
 		if(def_lct_hdr->flag_o == 0) { /* TOI 16 bits */
 			toi = (word & 0x0000FFFF);
@@ -412,9 +268,13 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 		if(def_lct_hdr->flag_s == 1) { /* TSI 32 bits */
 			tsi = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
 			hdrlen += 4;
-		
+
 			if(tsi != ch->s->tsi) {
-				printf("Packet to wrong session: wrong TSI: %i\n", tsi);
+#ifdef _MSC_VER
+				printf("Packet to wrong session: wrong TSI: %I64u\n", tsi);
+#else
+				printf("Packet to wrong session: wrong TSI: %llu\n", tsi);
+#endif
 				fflush(stdout);
 				return HDR_ERROR;
 			}
@@ -425,11 +285,9 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 			return HDR_ERROR;
 		}
 
-#ifdef FIXME_ZAP_SESSION_CLOSE
 		if(def_lct_hdr->flag_a == 1) {
-			ch->s->state = STxStopped;
+			ch->s->state = SAFlagReceived;
 		}
-#endif
 
 		if(def_lct_hdr->flag_o == 0) { /* TOI 0 bits */
 
@@ -460,66 +318,63 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 			fflush(stdout);
 			return HDR_ERROR;
 		}
-                /*else if(def_lct_hdr->flag_o == 3) {
-                }*/
+		/*else if(def_lct_hdr->flag_o == 3) {
+		}*/
 	}
 
 	if(!toi == FDT_TOI) {
-
 		wanted_obj = get_wanted_object(ch->s, toi);
-		
+
 		if(wanted_obj == NULL) {
-			/*printf("Packet to not wanted toi: %i\n", toi);
-			fflush(stdout);*/
-			return HDR_ERROR;
+
+			if(ch->s->rx_fdt_instance_list == NULL || ch->s->waiting_fdt_instance == TRUE) {
+				return WAITING_FDT;
+			}
+			else {
+				/*printf("Packet to not wanted toi: %i\n", toi);
+				fflush(stdout);*/
+				return HDR_ERROR;
+			}
 		}
 
-		eslen = wanted_obj->eslen;
-		max_sblen = wanted_obj->max_sblen;
-		max_nb_of_es = wanted_obj->max_nb_of_enc_symb;
+		es_len = wanted_obj->es_len;
+		max_sb_len = wanted_obj->max_sb_len;
+		max_nb_of_es = wanted_obj->max_nb_of_es;
 		fec_enc_id = wanted_obj->fec_enc_id;
-		fec_inst_id = wanted_obj->fec_inst_id;
-		toilen = wanted_obj->toi_len;
+		transfer_len = wanted_obj->transfer_len;
+		content_enc_algo = wanted_obj->content_enc_algo;
 
-#ifdef USE_ZLIB
-		cont_enc_algo = wanted_obj->content_enc_algo;
-#endif
-
+		if(fec_enc_id == RS_FEC_ENC_ID) {
+			finite_field = wanted_obj->finite_field;
+			nb_of_es_per_group = wanted_obj->nb_of_es_per_group;
+		}
+		else {
+			fec_inst_id = wanted_obj->fec_inst_id;
+		}
 	}
 
 	fec_enc_id = def_lct_hdr->codepoint;
 
-	if(fec_enc_id == COM_NO_C_FEC_ENC_ID) {
-	}
-
-#ifdef USE_REED_SOLOMON
-	else if(fec_enc_id == SB_SYS_FEC_ENC_ID) {
-	}
-#endif
-
-#ifdef USE_SIMPLE_XOR
-	else if(fec_enc_id == SIMPLE_XOR_FEC_ENC_ID) {
-	}
-#endif
-	else {
-		printf("FEC Encoding ID: %i is not supported!\n", fec_enc_id);
-                fflush(stdout);
-                return HDR_ERROR;
+	if(!(fec_enc_id == COM_NO_C_FEC_ENC_ID || fec_enc_id == RS_FEC_ENC_ID ||
+		fec_enc_id == SB_SYS_FEC_ENC_ID || fec_enc_id == SIMPLE_XOR_FEC_ENC_ID)) {
+			printf("FEC Encoding ID: %i is not supported!\n", fec_enc_id);
+			fflush(stdout);
+			return HDR_ERROR;
 	}
 
 	if(def_lct_hdr->hdr_len > (hdrlen >> 2)) {
-		
+
 		/* LCT header extensions(EXT_FDT, EXT_CENC, EXT_FTI, EXT_AUTH, EXT_NOP)
-		   go through all possible EH */
-		
+		go through all possible EH */
+
 		exthdrlen = def_lct_hdr->hdr_len - (hdrlen >> 2);
-	
+
 		while(exthdrlen > 0) {
-			
+
 			word = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
 			hdrlen += 4;
 			exthdrlen--;
-		
+
 			het = (word & 0xFF000000) >> 24;
 
 			if(het < 128) {
@@ -528,105 +383,127 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 
 			switch(het) {
 
-				case EXT_FDT:
+	  case EXT_FDT:
 
-					flute_version = (word & 0x00F00000) >> 20;
-					fdt_instance_id = (word & 0x000FFFFF);
+		  flute_version = (word & 0x00F00000) >> 20;
+		  fdt_instance_id = (word & 0x000FFFFF);
 
-					if(flute_version != FLUTE_VERSION) {
-						printf("FLUTE version: %i is not supported\n", flute_version);
-						return HDR_ERROR;
-					}
+		  if(flute_version != FLUTE_VERSION) {
+			  printf("FLUTE version: %i is not supported\n", flute_version);
+			  return HDR_ERROR;
+		  }
 
-					break;
+		  break;
 
-				case EXT_CENC:
+	  case EXT_CENC:
 
-					cont_enc_algo = (word & 0x00FF0000) >> 16;
-					reserved = (word & 0x0000FFFF);
+		  content_enc_algo = (word & 0x00FF0000) >> 16;
+		  reserved = (word & 0x0000FFFF);
 
-					if(reserved != 0) {
-						printf("Bad CENC header extension!\n");
-						return HDR_ERROR;
-					}
+		  if(reserved != 0) {
+			  printf("Bad CENC header extension!\n");
+			  return HDR_ERROR;
+		  }
 
 #ifdef USE_ZLIB
-					if(cont_enc_algo != ZLIB) {
-						printf("Only ZLIB supported with FDT Instance!\n");
-						return HDR_ERROR;
-					}
+		  if((content_enc_algo != 0) && (content_enc_algo != ZLIB)) {
+			  printf("Only NULL or ZLIB content encoding supported with FDT Instance!\n");
+			  return HDR_ERROR;
+		  }
+#else
+		  if(content_enc_algo != 0) {
+			  printf("Only NULL content encoding supported with FDT Instance!\n");
+			  return HDR_ERROR;
+		  }
 #endif
 
-					break;
+		  break;
 
-				case EXT_FTI:
-				
-					if(hel != 4) {
-						printf("Bad FTI header extension, length: %i\n", hel);
-						return HDR_ERROR;
-					}
-	
-					toilen = ((word & 0x0000FFFF) << 16);
-						
-					toilen += ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
-					hdrlen += 4;
-					exthdrlen--;
+	  case EXT_FTI:
 
-					word = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
-					hdrlen += 4;
-					exthdrlen--;
+		  if(hel != 4) {
+			  printf("Bad FTI header extension, length: %i\n", hel);
+			  return HDR_ERROR;
+		  }
 
-					fec_inst_id = ((word & 0xFFFF0000) >> 16);
+		  transfer_len = ((word & 0x0000FFFF) << 16);
 
-#ifdef USE_REED_SOLOMON
-					if(fec_enc_id == SB_SYS_FEC_ENC_ID) {
-						if(fec_inst_id != REED_SOL_FEC_INST_ID) {
-							printf("FEC Encoding %i/%i is not supported!\n", fec_enc_id, fec_inst_id);
-							return HDR_ERROR;
-						}
-					}
-#endif
-					if(((fec_enc_id == COM_NO_C_FEC_ENC_ID) || (fec_enc_id == SB_LB_E_FEC_ENC_ID)
-						|| (fec_enc_id == COM_FEC_ENC_ID) || (fec_enc_id == SIMPLE_XOR_FEC_ENC_ID))) {
-						
-						eslen = (word & 0x0000FFFF);
-						
-						max_sblen = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
-						hdrlen += 4;
-						exthdrlen--;
-					}
-					else if(fec_enc_id == SB_SYS_FEC_ENC_ID) {
+		  transfer_len += ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
+		  hdrlen += 4;
+		  exthdrlen--;
 
-						eslen = (word & 0x0000FFFF);
+		  word = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
+		  hdrlen += 4;
+		  exthdrlen--;
 
-						word = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
+		  if(fec_enc_id == RS_FEC_ENC_ID) {
+			  finite_field = (word & 0xFF000000) >> 24;
+			  nb_of_es_per_group = (word & 0x00FF0000) >> 16;
 
-						max_sblen = ((word & 0xFFFF0000) >> 16);
-						max_nb_of_es = (word & 0x0000FFFF);
+			  /*if(finite_field < 2 || finite_field >16) {
+				  printf("Finite Field parameter: %i not supported!\n", finite_field);
+				  return HDR_ERROR;
+			  }*/
+		  }
+		  else {
+			  fec_inst_id = ((word & 0xFFFF0000) >> 16);
 
-						hdrlen += 4;
-						exthdrlen--;
-						
-					}
-				break;
+			  if((fec_enc_id == COM_NO_C_FEC_ENC_ID || fec_enc_id == SIMPLE_XOR_FEC_ENC_ID)
+				  && fec_inst_id != 0) {
+					  printf("Bad FTI header extension.\n");
+					  return HDR_ERROR;
+			  }
+			  else if(fec_enc_id == SB_SYS_FEC_ENC_ID && fec_inst_id != REED_SOL_FEC_INST_ID) {
+				  printf("FEC Encoding %i/%i is not supported!\n", fec_enc_id, fec_inst_id);
+				  return HDR_ERROR;
+			  }
+		  }
 
-				case EXT_AUTH:
-					/* ignore */
-					hdrlen += (hel-1) << 2;
-					exthdrlen -= (hel-1);
-				break;
+		  if(((fec_enc_id == COM_NO_C_FEC_ENC_ID) || (fec_enc_id == SIMPLE_XOR_FEC_ENC_ID) 
+			  ||(fec_enc_id == SB_LB_E_FEC_ENC_ID) || (fec_enc_id == COM_FEC_ENC_ID))){
 
-				case EXT_NOP:
-					/* ignore */
-					hdrlen += (hel-1) << 2;
-					exthdrlen -= (hel-1);
-				break;
+				  es_len = (word & 0x0000FFFF);
 
-				default:
+				  max_sb_len = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
+				  hdrlen += 4;
+				  exthdrlen--;
+		  }
+		  else if(((fec_enc_id == RS_FEC_ENC_ID) || (fec_enc_id == SB_SYS_FEC_ENC_ID))) {
 
-					printf("Unknown LCT Extension header, het: %i\n", het);
-					return HDR_ERROR;
-				break;
+			  es_len = (word & 0x0000FFFF);
+
+			  word = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
+
+			  max_sb_len = ((word & 0xFFFF0000) >> 16);
+			  max_nb_of_es = (word & 0x0000FFFF);
+			  hdrlen += 4;
+			  exthdrlen--;
+		  }
+		  break;
+
+	  case EXT_AUTH:
+		  /* ignore */
+		  hdrlen += (hel-1) << 2;
+		  exthdrlen -= (hel-1);
+		  break;
+
+	  case EXT_NOP:
+		  /* ignore */
+		  hdrlen += (hel-1) << 2;
+		  exthdrlen -= (hel-1);
+		  break;
+
+	  case EXT_TIME:
+		  /* ignore */
+		  hdrlen += (hel-1) << 2;
+		  exthdrlen -= (hel-1);
+		  break;
+
+	  default:
+
+		  printf("Unknown LCT Extension header, het: %i\n", het);
+		  return HDR_ERROR;
+		  break;
 			}
 		}
 	}
@@ -634,7 +511,7 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 	if((hdrlen >> 2) != def_lct_hdr->hdr_len) {
 		/* Wrong header length */
 		printf("analyze_packet: packet header length %d, should be %d\n", (hdrlen >> 2),
-				def_lct_hdr->hdr_len);
+			def_lct_hdr->hdr_len);
 		return HDR_ERROR;
 	}
 
@@ -643,14 +520,17 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 		return EMPTY_PACKET;		
 	}
 
-#ifdef NO_HUP_PACKETS
-	if(((toi == 0) && (is_received_instance(ch->s, fdt_instance_id)))) {
-		return DUP_PACKET;
+	if(toi == 0) {
+		if(is_received_instance(ch->s, fdt_instance_id)) {
+			return DUP_PACKET;
+		}
+		else {
+			ch->s->waiting_fdt_instance = TRUE;
+		}
 	}
-#endif
 
 	if((fec_enc_id == COM_NO_C_FEC_ENC_ID) || (fec_enc_id ==  COM_FEC_ENC_ID)) {
-		
+
 		if(len < hdrlen + 4) {
 			printf("analyze_packet: packet too short %d\n", len);
 			return HDR_ERROR;
@@ -658,7 +538,17 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 
 		word = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
 		sbn = (word >> 16);
-		esid = (word & 0xFFFF);
+		esi = (word & 0xFFFF);
+		hdrlen += 4;
+	}
+	else if(fec_enc_id == RS_FEC_ENC_ID) {
+		word = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
+
+		sbn = (word >> finite_field);
+		esi = (word & ((1 << finite_field) - 1));
+
+		/* finite_field is not used furthermore, default value used in fec.c (#define GF_BITS  8 in fec.h) */
+
 		hdrlen += 4;
 	}
 	else if(((fec_enc_id == SB_LB_E_FEC_ENC_ID) || (fec_enc_id == SIMPLE_XOR_FEC_ENC_ID))) {
@@ -669,9 +559,9 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 
 		sbn = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
 		hdrlen += 4;
-		esid = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
+		esi = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
 		hdrlen += 4;
-		
+
 	}
 	else if(fec_enc_id == SB_SYS_FEC_ENC_ID) {
 		if (len < hdrlen + 8) {
@@ -683,8 +573,8 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 
 		hdrlen += 4;
 		word = ntohl(*(unsigned int*)((char*)def_lct_hdr + hdrlen));
-		sblen = (word >> 16);
-		esid = (word & 0xFFFF);
+		sb_len = (word >> 16);
+		esi = (word & 0xFFFF);
 		hdrlen += 4;
 	}
 
@@ -694,349 +584,764 @@ int analyze_packet(char *data, int len, alc_channel_t *ch) {
 
 		/* check if we have enough information */
 
-		if(((toilen == 0) || (fec_enc_id == -1) || ((fec_enc_id > 127) && (fec_inst_id == -1)) ||
-			(eslen == 0) || (max_sblen == 0))) {
-#ifdef WIN32
-			printf("Not enough information to create Transport Object, TOI: %I64u\n", toi);
+		if(((transfer_len == 0) || (fec_enc_id == -1) || ((fec_enc_id > 127) && (fec_inst_id == -1)) ||
+			(es_len == 0) || (max_sb_len == 0))) {
+#ifdef _MSC_VER
+				printf("Not enough information to create Transport Object, TOI: %I64u\n", toi);
 #else
-			printf("Not enough information to create Transport Object, TOI: %llu\n", toi);
+				printf("Not enough information to create Transport Object, TOI: %llu\n", toi);
 #endif
-			fflush(stdout);
-			return HDR_ERROR;
+				fflush(stdout);
+				return HDR_ERROR;
 		}
 
-		/* Create transport unit */
-		trans_unit = create_units(1);
-
-		if(trans_unit == NULL) {
-			return MEM_ERROR;
-		}
-
-		trans_unit->esid = esid;
-		trans_unit->len = len - hdrlen; /* Data length */
-
-		/* Alloc memory for incoming TU data */
-		if(!(trans_unit->data = (char*)calloc(eslen, sizeof(char)))) { /* rs_fec&xor_fec: trans_unit->len --> eslen */
-			printf("Could not alloc memory for transport unit's data!\n");
-			return MEM_ERROR;
-		}
-
-		memcpy(trans_unit->data, (data + hdrlen), trans_unit->len);
-
-		/* Check if object already exist */
-		if(toi == FDT_TOI) {
-			trans_obj = object_exist(fdt_instance_id, ch->s, 0);
+		if(fec_enc_id == RS_FEC_ENC_ID) {
+			nb_of_symbols = nb_of_es_per_group;
 		}
 		else {
-			trans_obj = object_exist(toi, ch->s, 1);
-		}
-		
-		if(trans_obj == NULL) {
+			/* Let's check how many symbols are in the packet */
+			/* Encoding Symbol group length = len - hdrlen */
 
-			trans_obj = create_object();
+			nb_of_symbols = (unsigned short)ceil((double)(len - hdrlen) / es_len);
+		}
+
+		/* Now we have to go through each symbol */
+
+		for(j = 0; j < nb_of_symbols; j++) {
+
+#ifdef USE_RETRIEVE_UNIT
+			/* Retrieve a transport unit from the session pool  */
+			trans_unit = retrieve_unit(ch->s, es_len);
+#else
+			/* Create transport unit */
+			trans_unit = create_units(1);
+#endif
+
+			if(trans_unit == NULL) {
+				return MEM_ERROR;
+			}
+
+			trans_unit->esi = esi + j;
+			trans_unit->len = es_len;
+
+#ifndef USE_RETRIEVE_UNIT
+			/* Alloc memory for incoming TU data */
+			if(!(trans_unit->data = (char*)calloc(es_len, sizeof(char)))) {
+				printf("Could not alloc memory for transport unit's data!\n");
+				return MEM_ERROR;
+			}
+#endif
+
+			memcpy(trans_unit->data, (data + hdrlen + j*es_len), trans_unit->len);
+
+			/* Check if object already exist */
+			if(toi == FDT_TOI) {
+				trans_obj = object_exist(fdt_instance_id, ch->s, 0);
+			}
+			else {
+				trans_obj = object_exist(toi, ch->s, 1);
+			}
 
 			if(trans_obj == NULL) {
-				return MEM_ERROR;
-			}
-			
-			if(toi == FDT_TOI) {
-				trans_obj->toi = fdt_instance_id;
-#ifdef USE_ZLIB
-				trans_obj->cont_enc_algo = cont_enc_algo;
-#endif
-			}
-			else {
-				trans_obj->toi = toi;
-				
-				if(ch->s->big_file_mode) {
-			
-					memset(filename, 0, MAX_PATH);
 
-#ifdef USE_ZLIB
-					if(cont_enc_algo == 0) {
-#ifdef WIN32
-						sprintf(filename, "%s\\object%I64u", ch->s->base_dir, toi);
-#else
-						sprintf(filename, "%s/object%llu", ch->s->base_dir, toi);
-#endif
-					}
-					else if(cont_enc_algo == GZIP) {
-#ifdef WIN32
-						sprintf(filename, "%s\\object%I64u%s", ch->s->base_dir, toi, GZ_SUFFIX);
-#else
-						sprintf(filename, "%s/object%llu%s", ch->s->base_dir, toi, GZ_SUFFIX);
-#endif
-					}
-					else {
-#ifdef WIN32
-						sprintf(filename, "%s\\object%I64u", ch->s->base_dir, toi);
-#else
-						sprintf(filename, "%s/object%llu", ch->s->base_dir, toi);
-#endif
-					}
-#else
+				trans_obj = create_object();
 
-#ifdef WIN32
-					sprintf(filename, "%s\\object%I64u", ch->s->base_dir, toi);
-#else
-					sprintf(filename, "%s/object%llu", ch->s->base_dir, toi);
-#endif
-
-#endif
-					/* Alloc memory for tmp_filename */
-					if(!(trans_obj->tmp_filename = (char*)calloc(strlen(filename)+1, sizeof(char)))) {
-				  		printf("Could not alloc memory for tmp_filename!\n");
-				  		return MEM_ERROR;
-					}
-
-					memcpy(trans_obj->tmp_filename, filename, strlen(filename));
-
-#ifdef WIN32
-        			if((trans_obj->fd = open((const char*)trans_obj->tmp_filename,
-											 _O_WRONLY | _O_CREAT | _O_BINARY | _O_TRUNC , _S_IWRITE)) < 0) {
-#else
-        			if((trans_obj->fd = open(trans_obj->tmp_filename,
-											 O_WRONLY | O_CREAT | O_TRUNC , S_IRWXU)) < 0) {
-#endif
-                		printf("Error: unable to open file %s\n", trans_obj->tmp_filename);
-                		fflush(stdout);
-                		return MEM_ERROR;
-        			}
+				if(trans_obj == NULL) {
+					return MEM_ERROR;
 				}
-			}
 
-			trans_obj->len = toilen;
-			trans_obj->fec_enc_id = (unsigned char)fec_enc_id;
-			trans_obj->fec_inst_id = (unsigned short)fec_inst_id;
-			trans_obj->eslen = eslen;
-			trans_obj->max_sblen = max_sblen;
-
-			 /* Let's calculate the blocking structure for this object */
-
-			trans_obj->bs = compute_blocking_structure(toilen, max_sblen, eslen);
-
-			if(toi == FDT_TOI) {
-				insert_object(trans_obj, ch->s, 0);
-			}
-			else {
-				insert_object(trans_obj, ch->s, 1);
-			}
-		}
-
-		/* Check if block already exist */
-		trans_block = block_exist(sbn, trans_obj);
-		
-		if(trans_block == NULL) {
-
-			trans_block = create_block();
-
-			if(trans_block == NULL) {
-				return MEM_ERROR;
-			}
-
-			trans_block->sbn = sbn;	
-
-			if(fec_enc_id == COM_NO_C_FEC_ENC_ID) { 
-
-				if(sbn < trans_obj->bs->I) {
-					trans_block->k = trans_obj->bs->A_large;
+				if(toi == FDT_TOI) {
+					trans_obj->toi = fdt_instance_id;
+					trans_obj->content_enc_algo = content_enc_algo;
 				}
 				else {
-					trans_block->k = trans_obj->bs->A_small;
+					trans_obj->toi = toi;
+
+
+					if(ch->s->rx_memory_mode == 1 || ch->s->rx_memory_mode == 2) {
+
+						memset(filename, 0, MAX_PATH_LENGTH);
+
+						if(content_enc_algo == 0) {
+							sprintf(filename, "%s/%s", ch->s->base_dir, "object_XXXXXX");
+							mktemp(filename);
+						}
+#ifdef USE_ZLIB
+						else if(content_enc_algo == GZIP) {
+							sprintf(filename, "%s/%s", ch->s->base_dir, "object_XXXXXX");
+							mktemp(filename);
+							strcat(filename, GZ_SUFFIX);
+						}
+#endif
+						else if(content_enc_algo == PAD) {
+							sprintf(filename, "%s/%s", ch->s->base_dir, "object_XXXXXX");
+							mktemp(filename);
+							strcat(filename, PAD_SUFFIX);
+						}
+
+						/* Alloc memory for tmp_filename */
+						if(!(trans_obj->tmp_filename = (char*)calloc(strlen(filename)+1, sizeof(char)))) {
+							printf("Could not alloc memory for tmp_filename!\n");
+							return MEM_ERROR;
+						}
+
+						memcpy(trans_obj->tmp_filename, filename, strlen(filename));
+
+#ifdef _MSC_VER
+						if((trans_obj->fd = open((const char*)trans_obj->tmp_filename,
+							_O_WRONLY | _O_CREAT | _O_BINARY | _O_TRUNC , _S_IWRITE)) < 0) {
+#else
+						if((trans_obj->fd = open64(trans_obj->tmp_filename,
+							O_WRONLY | O_CREAT | O_TRUNC , S_IRWXU)) < 0) {
+#endif
+								printf("Error: unable to open file %s\n", trans_obj->tmp_filename);
+								fflush(stdout);
+								return MEM_ERROR;
+						}
+					}
+
+
+					if(ch->s->rx_memory_mode == 2) {
+
+						/* when receiver is in large file mode a tmp file is used to store the data symbols */
+
+						memset(filename, 0, MAX_PATH_LENGTH);
+						sprintf(filename, "%s/%s", ch->s->base_dir, "st_XXXXXX");
+						mktemp(filename);
+
+						/* Alloc memory for tmp_st_filename */
+						if(!(trans_obj->tmp_st_filename = (char*)calloc(strlen(filename)+1, sizeof(char)))) {
+							printf("Could not alloc memory for tmp_st_filename!\n");
+							return MEM_ERROR;
+						}
+
+						memcpy(trans_obj->tmp_st_filename, filename, strlen(filename));
+
+#ifdef _MSC_VER
+						if((trans_obj->fd_st = open((const char*)trans_obj->tmp_st_filename,
+							_O_RDWR | _O_CREAT | _O_BINARY | _O_TRUNC , _S_IREAD | _S_IWRITE)) < 0) {
+#else
+						if((trans_obj->fd_st = open64(trans_obj->tmp_st_filename,
+							O_RDWR | O_CREAT | O_TRUNC , S_IRWXU)) < 0) {
+#endif
+								printf("Error: unable to open file %s\n", trans_obj->tmp_st_filename);
+								fflush(stdout);
+								return MEM_ERROR;
+						}
+					}  
+				}
+
+				trans_obj->len = transfer_len;
+				trans_obj->fec_enc_id = (unsigned char)fec_enc_id;
+				trans_obj->fec_inst_id = (unsigned short)fec_inst_id;
+				trans_obj->es_len = es_len;
+				trans_obj->max_sb_len = max_sb_len;
+
+				/* Let's calculate the blocking structure for this object */
+
+				trans_obj->bs = compute_blocking_structure(transfer_len, max_sb_len, es_len);
+
+				if(!(trans_obj->block_list = (trans_block_t*)calloc(trans_obj->bs->N, sizeof(trans_block_t)))) {
+					printf("Could not alloc memory for transport block list!\n");
+					return MEM_ERROR;
+				}
+
+				if(toi == FDT_TOI) {
+					insert_object(trans_obj, ch->s, 0);
+				}
+				else {
+					insert_object(trans_obj, ch->s, 1);
 				}
 			}
-			else if(fec_enc_id == SB_SYS_FEC_ENC_ID) {
 
-				trans_block->k = sblen;
-				trans_block->max_k = max_sblen;
-				trans_block->max_n = max_nb_of_es;
-			}
-			else if(fec_enc_id == SIMPLE_XOR_FEC_ENC_ID) {
-				
-				if(sbn < trans_obj->bs->I) {
-					trans_block->k = trans_obj->bs->A_large;
-                }
-                else {
-					trans_block->k = trans_obj->bs->A_small;
-                }
+			trans_block = trans_obj->block_list+sbn;
 
-				trans_block->max_k = max_sblen;
-			}	
-		
-			insert_block(trans_block, trans_obj);
-		}
+			if(trans_block->nb_of_rx_units == 0) {
+				trans_block->sbn = sbn;
 
-		if(!block_ready_to_decode(trans_block)) {
+				if(fec_enc_id == COM_NO_C_FEC_ENC_ID) { 
 
-			if(insert_unit(trans_unit, trans_block, trans_obj) != 1) {
-
-#ifdef WIN32
-am_progress((double)((double)100 * ((double)(LONGLONG)trans_obj->rx_bytes/(double)(LONGLONG)trans_obj->len)), toi);
-#else
-am_progress((double)((double)100 * ((double)(long long)trans_obj->rx_bytes/(double)(long long)trans_obj->len)), toi);
-#endif
-				if(ch->s->verbosity) {
-#ifdef WIN32
-					printf("%.2f%% of object received,",
-						(double)((double)100 * ((double)(LONGLONG)trans_obj->rx_bytes/(double)(LONGLONG)trans_obj->len)));
-					
-					/*printf("%i%% of object received,",
-						(int)((double)100 * ((double)(LONGLONG)trans_obj->rx_bytes/(double)(LONGLONG)trans_obj->len)));
-					*/
-#else
-					printf("%.2f%% of object received,",
-                                                (double)((double)100 * ((double)(long long)trans_obj->rx_bytes/(double)(long long)trans_obj->len)));
-					/*printf("%i%% of object received,",
-                                                (int)((double)100 * ((double)(long long)trans_obj->rx_bytes/(double)(long long)trans_obj->len)));*/
-#endif
-
-#ifdef WIN32
-					printf(" TOI: %I64u", toi);
-#else
-					printf(" TOI: %llu", toi);
-#endif
-
-					printf(" (SBN: %i ESI: %i LAYERS=%i)\n", sbn, esid, ch->s->nb_channel);
-					fflush(stdout);
+					if(sbn < trans_obj->bs->I) {
+						trans_block->k = trans_obj->bs->A_large;
+					}
+					else {
+						trans_block->k = trans_obj->bs->A_small;
+					}
 				}
-				retval = OK;
+				else if(fec_enc_id == SB_SYS_FEC_ENC_ID) {
+
+					trans_block->k = sb_len;
+					trans_block->max_k = max_sb_len;
+					trans_block->max_n = max_nb_of_es;
+				}
+				else if(fec_enc_id == SIMPLE_XOR_FEC_ENC_ID) {
+
+					if(sbn < trans_obj->bs->I) {
+						trans_block->k = trans_obj->bs->A_large;
+					}
+					else {
+						trans_block->k = trans_obj->bs->A_small;
+					}
+
+					trans_block->max_k = max_sb_len;
+				}
+				else if(fec_enc_id == RS_FEC_ENC_ID) {
+
+					if(sbn < trans_obj->bs->I) {
+						trans_block->k = trans_obj->bs->A_large;
+					}
+					else {
+						trans_block->k = trans_obj->bs->A_small;
+					}
+
+					trans_block->max_k = max_sb_len;
+					trans_block->max_n = max_nb_of_es;
+
+					/*trans_block->finite_field = finite_field;*/
+				}
+			}
+
+			if(!block_ready_to_decode(trans_block)) {
+
+				if(insert_unit(trans_unit, trans_block, trans_obj) != 1) {
+
+					if(toi == FDT_TOI || ch->s->rx_memory_mode == 0) { 
+
+						if(block_ready_to_decode(trans_block)) {
+							trans_obj->nb_of_ready_blocks++;
+						}
+					}
+
+					/* if large file mode data symbol is stored in the tmp file */
+					if(toi != FDT_TOI && ch->s->rx_memory_mode == 2) {
+
+#ifdef _MSC_VER
+						trans_unit->offset = _lseeki64(trans_obj->fd_st, 0, SEEK_END);
+#else
+						trans_unit->offset = lseek64(trans_obj->fd_st, 0, SEEK_END);
+#endif
+						if(trans_unit->offset == -1) {
+#ifdef _MSC_VER
+							printf("lseek error, toi: %I64u\n", toi);
+#else
+							printf("lseek error, toi: %llu\n", toi);
+#endif
+							fflush(stdout);
+							set_session_state(ch->s->s_id, SExiting);
+							return MEM_ERROR;
+						}
+
+						if(write(trans_obj->fd_st, trans_unit->data, (unsigned int)trans_unit->len) == -1) {
+#ifdef _MSC_VER
+							printf("write error, toi: %I64u, sbn: %i\n", toi, sbn);
+#else
+							printf("write error, toi: %llu, sbn: %i\n", toi, sbn);
+#endif
+							fflush(stdout);
+							set_session_state(ch->s->s_id, SExiting);
+							return MEM_ERROR;
+						}
+
+#ifndef USE_RETRIEVE_UNIT
+						free(trans_unit->data);
+						trans_unit->data = NULL;
+#endif
+					}
+
+					if(((toi == FDT_TOI && ch->s->verbosity == 4) || (toi != FDT_TOI && ch->s->verbosity > 1))) {
+
+						rx_percent = (double)((double)100 *
+							((double)(long long)trans_obj->rx_bytes/(double)(long long)trans_obj->len));
+
+						if(((rx_percent >= (trans_obj->last_print_rx_percent + 1)) || (rx_percent == 100))) {
+							trans_obj->last_print_rx_percent = rx_percent;
+							printf("%.2f%% of object received (TOI=%llu LAYERS=%i)\n", rx_percent,
+								toi, ch->s->nb_channel);
+							fflush(stdout);
+						}
+					}
+				}
+				else {
+
+#ifdef USE_RETRIEVE_UNIT
+					trans_unit->used = 0;
+#else
+					free(trans_unit->data);
+					free(trans_unit);
+#endif
+					return DUP_PACKET;
+				}
 			}
 			else {
+
+#ifdef USE_RETRIEVE_UNIT
+				trans_unit->used = 0;
+#else
 				free(trans_unit->data);
 				free(trans_unit);
-				retval = DUP_PACKET;
+#endif
+				return DUP_PACKET;
 			}
-		}
-		else {
-			free(trans_unit->data);
-			free(trans_unit);
-			return DUP_PACKET;
-		}
 
-		if(toi != FDT_TOI) {
-		
-			if(ch->s->big_file_mode) {	
-		  		if(block_ready_to_decode(trans_block)) {
+			if(toi != FDT_TOI) {
 
-					trans_obj->nb_of_ready_blocks++;
+				if(ch->s->rx_memory_mode == 1 || ch->s->rx_memory_mode == 2) {	
 
-					printf("[%i/%i Source Blocks decoded]\n", trans_obj->nb_of_ready_blocks,
-							trans_obj->bs->N);
-					fflush(stdout);
+					if(block_ready_to_decode(trans_block)) {
 
-		    		/* decode and save data */
-		
-					if(fec_enc_id == COM_NO_C_FEC_ENC_ID) {
-#ifdef USE_NULL_FEC
-		      			buf = null_fec_decode_src_block(trans_block, &block_len, eslen);
+						if(ch->s->rx_memory_mode == 2){
 
-/* Possible your own NULL-FEC library
-#elif YOUR_OWN_NULL_FEC
-							buf = your_own_null_fec(trans_block, &block_len, eslen);			
-*/							
-#endif
-					}
-#ifdef USE_SIMPLE_XOR
-                    else if(fec_enc_id == SIMPLE_XOR_FEC_ENC_ID) {
-                            buf = xor_fec_decode_src_block(trans_block, &block_len, eslen);
-                    }
-#endif
+							/* We have to restore the data symbols to trans_units from the symbol store tmp file */
 
-#ifdef USE_REED_SOLOMON
-					else if(fec_enc_id == SB_SYS_FEC_ENC_ID && fec_inst_id == REED_SOL_FEC_INST_ID) {		
-						buf = rs_fec_decode_src_block(trans_block, &block_len, eslen);
-					}
-#endif
-					if(buf == NULL) {
-						return MEM_ERROR;
-					}
+							next_tu = trans_block->unit_list;
 
-		      		if(trans_block->sbn < trans_obj->bs->I) {
-						pos = ((trans_block->sbn) * (trans_obj->bs->A_large)) * eslen;
-		      		}
-		      		else {
-						pos = ( ( (trans_obj->bs->I) * (trans_obj->bs->A_large) ) + 
-			       				( (trans_block->sbn - trans_obj->bs->I) * (trans_obj->bs->A_small) ) ) * eslen;
-		      		}
+							while(next_tu != NULL) {
 
-				/* We have to check if there is padding in the last source symbol of the last source block */
-		
-		      		if(trans_block->sbn == ((trans_obj->bs->N) - 1)) {
-						block_len = (trans_obj->len - (eslen * (trans_obj->bs->I * trans_obj->bs->A_large +
-							    (trans_obj->bs->N - trans_obj->bs->I -1) * trans_obj->bs->A_small)));
-		      		}
-		      		/*else {
-						block_len = trans_block->len * eslen;
-		      		}*/
-		
-					/* set correct position */
+								tu = next_tu;
 
-					if(lseek(trans_obj->fd, (unsigned int)pos, SEEK_SET) == -1) {
-#ifdef WIN32
-						printf("lseek error, toi: %I64u\n", toi);
+#ifdef _MSC_VER
+								if(_lseeki64(trans_obj->fd_st, tu->offset, SEEK_SET) == -1) {
 #else
-						printf("lseek error, toi: %llu\n", toi);
+								if(lseek64(trans_obj->fd_st, tu->offset, SEEK_SET) == -1) {
 #endif
-						fflush(stdout);
-						free(buf);
-						set_session_state(ch->s->s_id, SExiting);
-						return MEM_ERROR;
-					}
-					
-					if(write(trans_obj->fd, buf, (unsigned int)block_len) == -1) {
-#ifdef WIN32
-						printf("write error, toi: %I64u, sbn: %i\n", toi, sbn);
-#else
-						printf("write error, toi: %llu, sbn: %i\n", toi, sbn);
-#endif
-						fflush(stdout);
-						free(buf);
-						set_session_state(ch->s->s_id, SExiting);
-						return MEM_ERROR;
-					}
 
-		      		free(buf);
-					trans_block->completed = true;
+#ifdef _MSC_VER
+									printf("lseek error, toi: %I64u\n", toi);
+#else
+									printf("alc_rx.c line 1035 lseek error, toi: %llu\n", toi);
+#endif
+									fflush(stdout);
+									set_session_state(ch->s->s_id, SExiting);
+									return MEM_ERROR;
+								}
+
+								/* let's copy the data symbols from the tmp file to the memory */
+
+								/* Alloc memory for restoring data symbol */
+
+								if(!(tu->data = (char*)calloc(tu->len, sizeof(char)))) {
+									printf("Could not alloc memory for transport unit's data!\n");
+									return MEM_ERROR;
+								}
+
+								if(read(trans_obj->fd_st, tu->data, tu->len) == -1) {
+#ifdef _MSC_VER
+									printf("read error, toi: %I64u, sbn: %i\n", toi, sbn);
+#else
+									printf("read error, toi: %llu, sbn: %i\n", toi, sbn);
+#endif
+									fflush(stdout);
+									set_session_state(ch->s->s_id, SExiting);
+									return MEM_ERROR;
+								}
+
+								next_tu = tu->next;
+							}
+						}
+
+						/* decode the block and save data to the tmp file */
+
+						if(fec_enc_id == COM_NO_C_FEC_ENC_ID) {
+							buf = null_fec_decode_src_block(trans_block, &block_len, es_len);
+						}
+						else if(fec_enc_id == SIMPLE_XOR_FEC_ENC_ID) {
+							buf = xor_fec_decode_src_block(trans_block, &block_len, es_len);
+						}
+						else if(fec_enc_id == RS_FEC_ENC_ID) {
+							buf = rs_fec_decode_src_block(trans_block, &block_len, es_len);
+						}
+						else if(fec_enc_id == SB_SYS_FEC_ENC_ID && fec_inst_id == REED_SOL_FEC_INST_ID) {		
+							buf = rs_fec_decode_src_block(trans_block, &block_len, es_len);
+						}
+
+						if(buf == NULL) {
+							return MEM_ERROR;
+						}
+
+						/* We have to check if there is padding in the last source symbol of the last source block */
+
+						if(trans_block->sbn == ((trans_obj->bs->N) - 1)) {
+							block_len = (trans_obj->len - (es_len * (trans_obj->bs->I * trans_obj->bs->A_large +
+								(trans_obj->bs->N - trans_obj->bs->I -1) * trans_obj->bs->A_small)));
+						}
+
+						if(trans_block->sbn < trans_obj->bs->I) {
+							pos = ( (unsigned long long)trans_block->sbn * (unsigned long long)trans_obj->bs->A_large * (unsigned long long)es_len );
+						}
+						else {
+							pos = ( ( ( (unsigned long long)trans_obj->bs->I * (unsigned long long)trans_obj->bs->A_large ) +
+								( (unsigned long long)trans_block->sbn - (unsigned long long)trans_obj->bs->I )  *
+								(unsigned long long)trans_obj->bs->A_small ) * (unsigned long long)es_len );
+						}
+
+						/* set correct position */
+
+#ifdef _MSC_VER
+						if(_lseeki64(trans_obj->fd, pos, SEEK_SET) == -1) {
+#else
+						if(lseek64(trans_obj->fd, pos, SEEK_SET) == -1) {
+#endif
+
+#ifdef _MSC_VER
+							printf("lseek error, toi: %I64u\n", toi);
+#else
+							printf("alc_rx.c line 1111 lseek error, toi: %llu\n", toi);
+#endif
+							fflush(stdout);
+							free(buf);
+							set_session_state(ch->s->s_id, SExiting);
+							return MEM_ERROR;
+						}
+
+						if(write(trans_obj->fd, buf, (unsigned int)block_len) == -1) {
+#ifdef _MSC_VER
+							printf("write error, toi: %I64u, sbn: %i\n", toi, sbn);
+#else
+							printf("write error, toi: %llu, sbn: %i\n", toi, sbn);
+#endif
+							fflush(stdout);
+							free(buf);
+							set_session_state(ch->s->s_id, SExiting);
+							return MEM_ERROR;
+						}
+
+						trans_obj->nb_of_ready_blocks++;
+
+						free(buf);
+
+#ifdef USE_RETRIEVE_UNIT
+						free_units2(trans_block);
+#else
+						free_units(trans_block);
+#endif
+
+						if(ch->s->verbosity > 2) {	
+#ifdef _MSC_VER
+							printf("%u/%u Source Blocks decoded (TOI=%I64u SBN=%u)\n", trans_obj->nb_of_ready_blocks, trans_obj->bs->N, toi, sbn);
+							fflush(stdout);
+#else
+							printf("%u/%u Source Blocks decoded (TOI=%llu SBN=%u)\n", trans_obj->nb_of_ready_blocks, trans_obj->bs->N, toi, sbn);
+							fflush(stdout);
+#endif
+						}
+					}
 				}
 			}
-		}
+		} /* End of "for(j = 0; j < nb_of_symbols; j++) {" */
 	}
 	else { /* We have an empty packet with FEC Payload ID */
-		retval = EMPTY_PACKET;	
+		return EMPTY_PACKET;	
 	}
 
-	return retval;
+	return OK;
 }
 
-/* 
- * This function gives an object to application, when it is completely received.
+/**
+ * This is a private function which receives unit(s) from the session's channels.
  *
- * Params:	int s_id: Session identifier,
- *			ULONGLONG/unsigned long long toi: Transport Object Identifier,
- *			ULONGLONG/unsigned long long *datalen: Pointer to object length,
- *			int *retval: Return value in error cases/stopping situations.
+ * @param s pointer to the session
  *
- * Return:	char*: Pointer to buffer which contains object's data,
- *			NULL: In errors/stopping situations
+ * @return number of correct packets received from ALC session, or 0 when state is SClosed or no packets,
+ * or -1 in error cases, or -2 when state is SExiting
  *
  */
 
-char* alc_recv(int s_id, 
-#ifdef WIN32			   
-			   ULONGLONG toi,
-			   ULONGLONG *data_len,
-#else
-			   unsigned long long toi,
-			   unsigned long long *data_len,
-#endif
-			   int *retval) {
+int recv_packet(alc_session_t *s) {
 
-	bool obj_completed = false;
+  char recvbuf[MAX_PACKET_LENGTH];
+  int recvlen;
+  int i;
+  int retval;
+  int recv_pkts = 0;
+  alc_channel_t *ch;
+  struct sockaddr_storage from;
+  
+  double loss_prob;
+  
+  alc_rcv_container_t *container;
+  int my_list_not_empty = 0;
+  
+#ifdef _MSC_VER
+  int fromlen;
+#else
+  socklen_t fromlen;
+#endif
+  
+  time_t systime;
+  unsigned long long curr_time;
+  
+  memset(recvbuf, 0, MAX_PACKET_LENGTH);
+  
+  for(i = 0; i < s->nb_channel; i++) {
+    ch = s->ch_list[i];
+    
+    if(ch->receiving_list != NULL) {
+      if(!is_empty(ch->receiving_list)) {
+	++my_list_not_empty;
+	break;
+      }
+    }
+  }
+  
+  if(my_list_not_empty == 0) {
+    
+    if(s->stoptime != 0) {
+      time(&systime);
+      curr_time = systime + 2208988800U;
+      
+      if(curr_time >= s->stoptime) {
+	s->state = SExiting;
+	return -2;
+      }
+    }
+    
+#ifdef _MSC_VER
+    Sleep(500);
+#else
+    usleep(500000);
+#endif
+    
+    if(s->state == SAFlagReceived) {
+      s->state = STxStopped;
+    }
+    
+    return 0;
+  }
+  
+  for(i = 0; i < s->nb_channel; i++) {
+    ch = s->ch_list[i];
+    
+    if(!is_empty(ch->receiving_list)) {
+      assert(ch->rx_socket_thread_id != 0);
+      
+      container = (alc_rcv_container_t*)pop_front(ch->receiving_list);
+      
+      assert(container != NULL);
+      
+      recvlen = container->recvlen;
+      from = container->from;
+      fromlen = container->fromlen;
+      memcpy(recvbuf, container->recvbuf, MAX_PACKET_LENGTH);
+      
+      if(recvlen < 0) {
+	
+	free(container);
+	container = NULL;
+	
+	if(s->state == SExiting) {
+	  printf("recv_packet() SExiting\n");
+	  fflush(stdout);
+	  return -2;
+	}
+	else if(s->state == SClosed) {
+	  printf("recv_packet() SClosed\n");
+	  fflush(stdout);
+	  return 0;
+	}
+	else {
+#ifdef _MSC_VER
+	  printf("recvfrom failed: %d\n", WSAGetLastError());
+	  fflush(stdout);
+#else
+	  printf("recvfrom failed: %d\n", errno);
+#endif
+	  return -1;
+	}
+      }
+      
+      loss_prob = 0;
+      
+      if(ch->s->simul_losses) {
+	if(ch->previous_lost == TRUE) {
+	  loss_prob = ch->s->loss_ratio2;
+	}
+	else {
+	  loss_prob = ch->s->loss_ratio1;
+	}
+      }
+      
+      if(!randomloss(loss_prob)) {
+	
+	retval = analyze_packet(recvbuf, recvlen, ch);
+	
+	if(ch->s->cc_id == RLC) {
+	  
+	  if(((ch->s->rlc->drop_highest_layer) && (ch->s->nb_channel != 1))) {
+	    
+	    ch->s->rlc->drop_highest_layer = FALSE;
+	    close_alc_channel(ch->s->ch_list[ch->s->nb_channel - 1], ch->s);
+	  }
+	}
+	
+	if(retval == WAITING_FDT) {
+	  push_front(ch->receiving_list, (void*)container);
+	}
+	else {
+	  free(container);
+	  container = NULL;
+	  
+	  if(retval == HDR_ERROR) {
+	    continue;
+	  }
+	  else if(retval == DUP_PACKET) {
+	    continue;
+	  }
+	  else if(retval == MEM_ERROR) {
+	    return -1;
+	  }
+	  
+	  recv_pkts++;
+	  
+	  ch->previous_lost = FALSE;
+	}
+      }
+      else {
+	ch->previous_lost = TRUE;
+      }
+    }
+  }    
+  return recv_pkts;
+}
+
+void* rx_socket_thread(void *ch) {
+
+  alc_channel_t *channel;
+  alc_rcv_container_t *container;
+  fd_set read_set;
+  struct timeval time_out;
+  char hostname[100];
+  int retval;
+  
+  channel = (alc_channel_t *)ch;
+  
+  while(channel->s->state == SActive) {
+
+    time_out.tv_sec = 1;
+    time_out.tv_usec = 0;
+
+    FD_ZERO(&read_set);
+    FD_SET(channel->rx_sock, &read_set);
+    
+    retval = select((int)channel->rx_sock + 1, &read_set, 0, 0, &time_out);
+  
+    if(retval > 0) {
+      if(!(container = (alc_rcv_container_t*)calloc(1, sizeof(alc_rcv_container_t)))) {
+	printf("Could not alloc memory for container!\n");
+	continue;
+      }
+      
+      if(channel->s->addr_family == PF_INET) {
+	container->fromlen = sizeof(struct sockaddr_in);
+      }
+      else if(channel->s->addr_family == PF_INET6) {
+	container->fromlen = sizeof(struct sockaddr_in6);
+      }
+      
+      container->recvlen = recvfrom(channel->rx_sock, container->recvbuf, MAX_PACKET_LENGTH, 
+				    0, (struct sockaddr*)&(container->from), &(container->fromlen));
+      
+#ifdef _MSC_VER
+      if(container->recvlen == -1) {
+	/* Some times when you quit program very quick after starting in Windows, select returns
+	   1, but there is nothing to be stored to the queue. Continue is for avoiding error */
+	continue;
+      }
+#endif
+      
+      getnameinfo((struct sockaddr*)&(container->from), container->fromlen,
+		  hostname, sizeof(hostname), NULL, 0, NI_NUMERICHOST);
+      
+      if(strcmp(channel->s->src_addr, "") != 0) {
+	if(strcmp(hostname, channel->s->src_addr) != 0) {
+	  printf("Packet to wrong session: wrong source: %s\n", hostname);
+	  fflush(stdout);
+	  continue;
+	}
+      }
+      
+      push_back(channel->receiving_list, (void*)container);
+      
+      if(strcmp(channel->s->src_addr, "") == 0) {
+	if(channel->s->verbosity > 0) {
+	  printf("Locked to source: %s\n", hostname);
+	  fflush(stdout);
+	}
+		
+	memcpy(channel->s->src_addr, hostname, strlen(hostname));
+      }
+    }
+    else {
+      continue;
+    }
+  }
+  
+#ifdef _MSC_VER
+  _endthread();
+#else
+  pthread_exit(0);
+#endif
+  
+  return NULL;
+}
+
+void join_rx_socket_thread(alc_channel_t *ch) {
+
+#ifndef _MSC_VER
+  int join_retval;
+#endif
+
+  if(ch != NULL) {
+#ifdef _MSC_VER
+    WaitForSingleObject(ch->handle_rx_socket_thread, INFINITE);
+    CloseHandle(ch->handle_rx_socket_thread);
+#else
+    join_retval = pthread_join(ch->rx_socket_thread_id, NULL);
+    assert(join_retval == 0);
+    pthread_detach(ch->rx_socket_thread_id);
+#endif
+  }
+}
+
+void* rx_thread(void *s) {
+  
+  alc_session_t *session;
+  int retval = 0;
+  
+  srand((unsigned)time(NULL));
+  
+  session = (alc_session_t *)s;
+  
+  while(session->state == SActive || session->state == SAFlagReceived) {
+    
+    if(session->nb_channel != 0) {
+      retval = recv_packet(session);
+    }
+    else {
+#ifdef _MSC_VER
+      Sleep(1);
+#else
+      usleep(1000);
+#endif
+    }
+  }
+  
+#ifdef _MSC_VER
+  _endthread();
+#else
+  pthread_exit(0);
+#endif
+  
+  return NULL;
+}
+
+char* alc_recv(int s_id, unsigned long long toi, unsigned long long *data_len, int *retval) {
+
+	BOOL obj_completed = FALSE;
 	alc_session_t *s;
 	char *buf = NULL; /* Buffer where to construct the object from data units */
 	trans_obj_t *to;
 	int object_exists = 0;
-	
+
 	s = get_alc_session(s_id);
 
 	while(!obj_completed) {
@@ -1080,7 +1385,7 @@ char* alc_recv(int s_id,
 			return NULL;	
 		}
 
-#ifdef WIN32
+#ifdef _MSC_VER
 		Sleep(1);
 #else
 		usleep(1000);
@@ -1092,31 +1397,21 @@ char* alc_recv(int s_id,
 
 	/* Parse data from object to data buffer, return buffer and buffer length */
 
-    to = object_exist(toi, s, 1);
+	to = object_exist(toi, s, 1);
 
 	if(to->fec_enc_id == COM_NO_C_FEC_ENC_ID) {
-#ifdef USE_NULL_FEC
 		buf = null_fec_decode_object(to, data_len, s);
-
-/* Possible your own NULL-FEC library
-#elif YOUR_OWN_NULL_FEC
-		buf = your_own_null_fec_decode_object(to, data_len, s);			
-*/							
-#endif
 	}
-
-#ifdef USE_SIMPLE_XOR
-        else if(to->fec_enc_id == SIMPLE_XOR_FEC_ENC_ID) {
-                buf = xor_fec_decode_object(to, data_len, s);
-        }
-#endif
-
-#ifdef USE_REED_SOLOMON
+	else if(to->fec_enc_id == SIMPLE_XOR_FEC_ENC_ID) {
+		buf = xor_fec_decode_object(to, data_len, s);
+	}
+	else if(to->fec_enc_id == RS_FEC_ENC_ID) {
+		buf = rs_fec_decode_object(to, data_len, s);
+	}
 	else if(to->fec_enc_id == SB_SYS_FEC_ENC_ID && to->fec_inst_id == REED_SOL_FEC_INST_ID) {
 		buf = rs_fec_decode_object(to, data_len, s);
 	}
-#endif
-			
+
 	if(buf == NULL) {
 		*retval = -1;
 	}
@@ -1125,45 +1420,20 @@ char* alc_recv(int s_id,
 	return buf;
 }
 
-/* 
- * This function gives any object to application, when it is completely received.
- *
- * Params:	int s_id: Session identifier,
- *			ULONGLONG/unsigned long long *toi: Pointer to Transport Object Identifier,
- *			ULONGLONG/unsigned long long *datalen: Pointer to object length,
- *			int *retval: Return value in error cases/stopping situations.
- *
- * Return:	char*: Pointer to buffer which contains object's data,
- *			NULL: In errors/stopping situations
- *
- */
+char* alc_recv2(int s_id, unsigned long long *toi, unsigned long long *data_len, int *retval) {
 
-char* alc_recv2(int s_id,
-#ifdef WIN32			   
-			   ULONGLONG *toi,
-			   ULONGLONG *data_len,
-#else
-			   unsigned long long *toi,
-			   unsigned long long *data_len,
-#endif
-			   int *retval) {
-
-	bool obj_completed = false;
+	BOOL obj_completed = FALSE;
 	alc_session_t *s;
 
-#ifdef WIN32			   
-	ULONGLONG tmp_toi;
-#else
-	unsigned long long tmp_toi;
-#endif
+	unsigned long long tmp_toi = 0;
 
 	char *buf = NULL; /* Buffer where to construct the object from data units */
 	trans_obj_t *to;
-	
+
 	s = get_alc_session(s_id);
 
 	while(1) {
-		
+
 		to = s->obj_list;
 
 		if(s->state == SExiting) {
@@ -1216,12 +1486,12 @@ char* alc_recv2(int s_id,
 
 			to = to->next;
 		}
-	
+
 		if(obj_completed) {
 			break;
 		}
 
-#ifdef WIN32
+#ifdef _MSC_VER
 		Sleep(1);
 #else
 		usleep(1000);
@@ -1237,28 +1507,18 @@ char* alc_recv2(int s_id,
 	to = object_exist(tmp_toi, s, 1);
 
 	if(to->fec_enc_id == COM_NO_C_FEC_ENC_ID) {
-#ifdef USE_NULL_FEC
 		buf = null_fec_decode_object(to, data_len, s);
-
-/* Possible your own NULL-FEC library
-#elif YOUR_OWN_NULL_FEC
-		buf = your_own_null_fec_decode_object(to, data_len, s);			
-*/							
-#endif
 	}
-
-#ifdef USE_SIMPLE_XOR
-        else if(to->fec_enc_id == SIMPLE_XOR_FEC_ENC_ID) {
-                buf = xor_fec_decode_object(to, data_len, s);
-        }
-#endif
-
-#ifdef USE_REED_SOLOMON
+	else if(to->fec_enc_id == SIMPLE_XOR_FEC_ENC_ID) {
+		buf = xor_fec_decode_object(to, data_len, s);
+	}
+	else if(to->fec_enc_id == RS_FEC_ENC_ID) {
+		buf = rs_fec_decode_object(to, data_len, s);
+	}
 	else if(to->fec_enc_id == SB_SYS_FEC_ENC_ID && to->fec_inst_id == REED_SOL_FEC_INST_ID) {
 		buf = rs_fec_decode_object(to, data_len, s);
 	}
-#endif
-			
+
 	if(buf == NULL) {
 		*retval = -1;
 	}
@@ -1270,43 +1530,20 @@ char* alc_recv2(int s_id,
 	return buf;
 }
 
-/*
- * This function gives temp filename of object to application, when object is completely received.
- *
- * Params:	int s_id: Session identifier,
- *			ULONGLONG/unsigned long long *toi: Pointer to Transport Object Identifier,
- *			char *tmp_filename: Pointer to object's temporary filename.
- *			int *retval: Return value in error cases/stopping situations.
- *
- * Return:	char*: Pointer to buffer which contains temporary filename,
- *			NULL: In errors/stopping situations.
- *
- */
+char* alc_recv3(int s_id, unsigned long long *toi, int *retval) {
 
-char* alc_recv3(int s_id,
-#ifdef WIN32			   
-				ULONGLONG *toi,
-#else
-				unsigned long long *toi,
-#endif
-				int *retval) {
-
-	bool obj_completed = false;
+	BOOL obj_completed = FALSE;
 	alc_session_t *s;
 
-#ifdef WIN32			   
-	ULONGLONG tmp_toi = 0;
-#else
 	unsigned long long tmp_toi = 0;
-#endif
 
 	trans_obj_t *to;
 	char *tmp_filename = NULL;
-	
+
 	s = get_alc_session(s_id);
 
 	while(1) {
-		
+
 		to = s->obj_list;
 
 		if(s->state == SExiting) {
@@ -1322,13 +1559,15 @@ char* alc_recv3(int s_id,
 			return NULL;	
 		}
 		else if(((s->state == STxStopped) && (to == NULL))) {
-			/*printf("alc_recv3() STxStopped\n");
+			/*printf("alc_recv3() STxStopped, to == NULL\n");
 			fflush(stdout);*/
 			*retval = -3;
 			return NULL;	
 		}
 
 		while(to != NULL) {
+
+			obj_completed = FALSE;
 
 			if(s->state == SExiting) {
 				/*printf("alc_recv3() SExiting\n");
@@ -1342,37 +1581,58 @@ char* alc_recv3(int s_id,
 				*retval = 0;
 				return NULL;	
 			}
+			else if(s->state == STxStopped) {
+				break;
+			}
 
-			obj_completed = object_completed2(to);
+			obj_completed = object_completed(to);
 
 			if(obj_completed) {
 				tmp_toi = to->toi;
 				break;
 			}
 
-			if(((s->state == STxStopped) && (!obj_completed))) {
-				/*printf("alc_recv3() STxStopped\n");
-				fflush(stdout);*/
-				*toi = tmp_toi;
-				*retval = -3;
-				return NULL;	
-			}
-
 			to = to->next;
 		}
-	
+
 		if(obj_completed) {
 			break;
 		}
+		else if(s->state == STxStopped) {
 
-#ifdef WIN32
+			/* Check if there is completed object after A-flag is received */
+
+			to = s->obj_list;
+
+			while(to != NULL) {
+
+				obj_completed = object_completed(to);
+
+				if(obj_completed) {
+					tmp_toi = to->toi;
+					break;
+				}
+
+				to = to->next;
+			}
+
+			if(obj_completed) {
+				break;
+			}
+			else {
+				/*printf("alc_recv3() STxStopped, any object not completed\n");
+				fflush(stdout);*/
+				*retval = -3;
+				return NULL;
+			}	
+		}
+
+#ifdef _MSC_VER
 		Sleep(1);
 #else
 		usleep(1000);
 #endif
 	}
-
-	printf("\n");
 
 	remove_wanted_object(s_id, tmp_toi);
 
@@ -1383,278 +1643,138 @@ char* alc_recv3(int s_id,
 	}
 
 	memcpy(tmp_filename, to->tmp_filename, strlen(to->tmp_filename));
+
 	free_object(to, s, 1);
 	*toi = tmp_toi;
 
-  	return tmp_filename;
+	return tmp_filename;
 }
 
-/* 
- * This function gives an FDT Instance to application, when it is completely received.
- *
- * Params:	int s_id: Session identifier,
- *			ULONGLONG/unsigne dlong long *data_len: Pointer to FDT Instance length,
- *			int *retval: Return value in error cases/stopping situations.
- *			unsigned char *cont_enc_algo: Location where to store used content encoding,
- *
- * Return:	char*: Pointer to buffer which contains FDT Instance's data,
- *			NULL: in errors/stopping situations
- *
- */
- 
+char* fdt_recv(int s_id, unsigned long long *data_len, int *retval,
+			   unsigned char *content_enc_algo, int* fdt_instance_id) {
 
-char* fdt_recv(int s_id,
-#ifdef WIN32
-				ULONGLONG *data_len,
+   alc_session_t *s;                                                                                                                                          
+   char *buf = NULL; /* Buffer where to construct the object from data units */                                                                                                                                     
+   trans_obj_t *to;
+   
+   s = get_alc_session(s_id);
+
+   while(1) {
+	   to = s->fdt_list;
+
+	   if(s->state == SExiting) {
+		   /*printf("fdt_recv() SExiting\n");
+		   fflush(stdout);*/
+		   *retval = -2;
+		   return NULL;
+	   }
+	   else if(s->state == SClosed) {
+		   /*printf("fdt_recv() SClosed\n");
+		   fflush(stdout);*/
+		   *retval = 0;
+		   return NULL;
+	   }
+	   else if(s->state == STxStopped) {
+		   /*printf("fdt_recv() STxStopped\n");
+		   fflush(stdout);*/
+		   *retval = -3;
+		   return NULL;	
+	   }
+
+	   if(to == NULL) {
+
+#ifdef _MSC_VER
+		   Sleep(1);
 #else
-				unsigned long long *data_len,
+		   usleep(1000);
 #endif
-				int *retval
-#ifdef USE_ZLIB
-				, unsigned char *cont_enc_algo
-#endif
-			   ) {
-	
-	alc_session_t *s;                                                                                                                                          
-	char *buf = NULL; /* Buffer where to construct the object from data units */                                                                                                                                     
-	trans_obj_t *to;
-        
-	s = get_alc_session(s_id);
-        
-	while(1) {
-		to = s->fdt_list;
+		   continue;	
+	   }
 
-		if(s->state == SExiting) {
-			/*printf("fdt_recv() SExiting\n");
-			fflush(stdout);*/
-			*retval = -2;
-			return NULL;
-		} else if(s->state == SClosed) {
-            /*printf("fdt_recv() SClosed\n");
-            fflush(stdout);*/
-			*retval = 0;
-			return NULL;
-		} else if(s->state == STxStopped) {
-			/*printf("fdt_recv() STxStopped\n");
-			fflush(stdout);*/
-			*retval = -3;
-			return NULL;	
-		}
-	
-		if(to == NULL) {
-			                                                                                                                                              
-#ifdef WIN32
-			Sleep(1);
+	   do {
+		   if(object_completed(to)) {
+			   set_received_instance(s, (unsigned int)to->toi);
+
+			   *content_enc_algo = to->content_enc_algo;
+			   *fdt_instance_id = (int)to->toi;
+
+			   if(to->fec_enc_id == COM_NO_C_FEC_ENC_ID) {
+				   buf = null_fec_decode_object(to, data_len, s);
+			   }
+			   else if(to->fec_enc_id == SIMPLE_XOR_FEC_ENC_ID) {
+				   buf = xor_fec_decode_object(to, data_len, s);
+			   }
+			   else if(to->fec_enc_id == RS_FEC_ENC_ID) {
+				   buf = rs_fec_decode_object(to, data_len, s);
+			   }
+			   else if(to->fec_enc_id == SB_SYS_FEC_ENC_ID && to->fec_inst_id == REED_SOL_FEC_INST_ID) {
+				   buf = rs_fec_decode_object(to, data_len, s);
+			   }
+
+			   if(buf == NULL) {
+				   *retval = -1;
+			   }
+
+			   free_object(to, s, 0);
+			   return buf;
+		   }
+		   to = to->next;
+	   } while(to != NULL);
+
+#ifdef _MSC_VER
+	   Sleep(1);
 #else
-			usleep(1000);
+	   usleep(1000);
 #endif
-			continue;	
-		}
-		
-		do {
+   }
 
-			if(object_completed(to)) {
-				set_received_instance(s, (unsigned int)to->toi);
-
-#ifdef USE_ZLIB
-				*cont_enc_algo = to->cont_enc_algo;
-#endif
-
-				if(to->fec_enc_id == COM_NO_C_FEC_ENC_ID) {
-#ifdef USE_NULL_FEC
-		      		buf = null_fec_decode_object(to, data_len, s);
-
-/* Possible your own NULL-FEC library
-#elif YOUR_OWN_NULL_FEC
-					buf = your_own_null_fec_decode_object(to, data_len, s);			
-*/							
-#endif
-				}
-#ifdef USE_SIMPLE_XOR
-        			else if(to->fec_enc_id == SIMPLE_XOR_FEC_ENC_ID) {
-                			buf = xor_fec_decode_object(to, data_len, s);
-        			}
-#endif
-
-#ifdef USE_REED_SOLOMON
-				else if(to->fec_enc_id == SB_SYS_FEC_ENC_ID && to->fec_inst_id == REED_SOL_FEC_INST_ID) {
-					buf = rs_fec_decode_object(to, data_len, s);
-				}
-#endif
-				if(buf == NULL) {
-					*retval = -1;
-				}
-
-				free_object(to, s, 0);
-				return buf;
-			}
-			to = to->next;
-		} while(to != NULL);
-
-#ifdef WIN32
-        Sleep(1);
-#else
-		usleep(1000);
-#endif
-	}
-
-	return buf;
+   return buf;
 }
 
+trans_obj_t* object_exist(unsigned long long toi, alc_session_t *s, int type) {
 
-/* 
- * This function checks if received unit belongs to an object which already exists in session or not. 
- *
- * Params:	ULONGLONG/unsigned long long toi: Transport Object Identifier,
- *			alc_session_t *s: Pointer to session,
- *			int type: Type of object to be checked (0 = FDT Instance, 1 = normal object)
- *
- * Return:	trans_obj_t*: Pointer to object in success, NULL otherwise 
- *
- */
+  trans_obj_t *trans_obj = NULL;
 
-trans_obj_t* object_exist(
-#ifdef WIN32
-						  ULONGLONG toi,
-#else
-						  unsigned long long toi,
-#endif
-						  alc_session_t *s, int type) {
-	
-	trans_obj_t *trans_obj;
+  if(type == 0) {
+	  trans_obj = s->fdt_list;
+  }
+  else if(type == 1) {
+	  trans_obj = s->obj_list;
+  }
 
-	if(type == 0) {
-		trans_obj = s->fdt_list;
-	}
-	else if(type == 1) {
-		trans_obj = s->obj_list;
-	}
+  if(trans_obj != NULL) {
+	  for(;;) {
+		  if(trans_obj->toi == toi) {
+			  break;
+		  }
+		  if(trans_obj->next == NULL) {
+			  trans_obj = NULL;
+			  break;
+		  }
+		  trans_obj = trans_obj->next;
+	  }
+  }
 
-	if(trans_obj != NULL) {
-		for(;;) {
-			if(trans_obj->toi == toi) {
-				break;
-			}
-			if(trans_obj->next == NULL) {
-				trans_obj = NULL;
-				break;
-			}
-			trans_obj = trans_obj->next;
-		}
-	}
-
-	return trans_obj;
+  return trans_obj;
 }
 
-/*
- * This function checks if received unit belongs to a source block, which already exists or not. 
- *
- * Params:	unsigned int sbn: Source Block Number,
- *			trans_obj_t *trans_obj: Pointer to object
- *
- * Return:	trans_block_t*: Pointer to block in success, NULL otherwise 
- *
- */
+BOOL object_completed(trans_obj_t *to) {
 
-trans_block_t* block_exist(unsigned int sbn, trans_obj_t *trans_obj) {
-	
-	trans_block_t *trans_block;
+	BOOL ready = FALSE;
 
-	trans_block = trans_obj->block_list;
-
-	if(trans_block != NULL) {
-		for(;;) {
-			if(trans_block->sbn == sbn) {
-				break;
-			}
-			if(trans_block->next == NULL) {
-				trans_block = NULL;
-				break;
-			}
-			trans_block = trans_block->next;
-		}
+	if(to->nb_of_ready_blocks == to->bs->N) {
+		ready = TRUE;
 	}
-
-	return trans_block;
-}
-
-/*
- * This function checks if the object has been received completely.
- *
- * Params:	trans_obj_t *to: Transport Object to be checked
- *
- * Return:	bool: true when object ready, false otherwise
- *
- */
-
-bool object_completed(trans_obj_t *to) {
-
-	bool ready = false;
-	trans_block_t *tb = to->block_list;
-
-	if(to->nb_of_created_blocks != to->bs->N) {
-		return ready;
-	}
-
-    while(tb != NULL) {
-
-        if(tb->nb_of_rx_units < tb->k) {
-			return ready;
-        }
-        tb = tb->next;
-    }
-
-    ready = true;
 
 	return ready;
 }
 
-/*
- * This function checks if the object has been received completely.
- *
- * Params:      trans_obj_t *to: Transport Object to be checked
- *
- * Return:      bool: true when object ready, false otherwise
- *
- */
+BOOL block_ready_to_decode(trans_block_t *tb) {
 
-bool object_completed2(trans_obj_t *to) {
+	BOOL ready = FALSE;
 
-    bool ready = false;
-    trans_block_t *tb = to->block_list;
-
-    if(to->nb_of_created_blocks != to->bs->N) {
-		return ready;
-	}
-
-    while(tb != NULL) {
-
-        if(!tb->completed) {
-			return ready;
-        }
-        tb = tb->next;
-    }
-
-	ready = true;
-
-    return ready;
-}
-
-/*
- * This function checks if the block has been received completely.
- *
- * Params:      trans_block_t *tb: Pointer to block
- *
- * Return:      bool: true when object ready, false otherwise
- *
- */
-
-bool block_ready_to_decode(trans_block_t *tb) {
-
-	bool ready = true;
-
-	if(tb->nb_of_rx_units < tb->k) {
-		ready = false;
+	if(tb->nb_of_rx_units >= tb->k) {
+		ready = TRUE;
 	}
 
 	return ready;
